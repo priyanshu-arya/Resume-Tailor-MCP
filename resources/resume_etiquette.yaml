@@ -1,0 +1,140 @@
+# Condensed resume/CV writing rules, distilled from two ~1,700-line
+# playbooks (university career-center + ATS/recruiting-system guidance:
+# UT Austin, UC Davis, UC Berkeley, Cornell, Harvard, MIT, UCSF, CRA,
+# USAJOBS, Indeed, Greenhouse -- research current as of Sept 2026). The
+# source .docx files were deleted after this extraction to avoid two
+# overlapping, stale copies -- update this file directly, it is the only
+# copy. Loaded as the resume://etiquette MCP resource and referenced by
+# score_ats() and the tailoring prompts below.
+
+golden_rule: >
+  AI may reorganize, tailor, and polish real evidence. It must never invent
+  metrics, technologies, titles, dates, publications, certifications, or
+  responsibilities. Every claim on the resume must be defensible in an
+  interview. When evidence is missing, ask or omit it -- never fabricate.
+
+document_type:
+  - "Corporate IT / software / data / cloud / security roles -> targeted resume (1-2 pages)."
+  - "IT/eng management, Director, VP -> executive resume: leadership scope, org/financial outcomes over task detail."
+  - "University faculty / postdoc -> academic CV + required statements (research/teaching/DEI as requested)."
+  - "Industry research scientist / R&D -> research resume or CV per the posting; balance publications with product/business relevance."
+  - "Never force a long academic CV into an industry resume, or a 1-page resume into a faculty application -- the audiences evaluate differently."
+
+page_and_format:
+  page_size: "US Letter default for US/international corporate; A4 common for India/Europe/academic. Follow the portal if it specifies one."
+  margins: "0.5-1.0 in, balanced on all sides. Never shrink below 0.5 in just to force a page count."
+  body_font_pt: "10-12 pt (10.5-11.5 is the sweet spot for dense IT resumes). Never below 10 pt."
+  name_pt: "14-24 pt."
+  heading_pt: "11-14 pt, bold."
+  fonts: "Arial, Calibri/Aptos, Helvetica, Times New Roman, or similarly plain/legible fonts only. No script/decorative/novelty fonts."
+  layout: "Single column, standard section headings (Summary, Skills, Experience, Education, Projects, Certifications...). Avoid tables/text boxes/columns/graphics for anything essential -- many ATS parsers mis-order or drop them."
+  length_by_stage:
+    fresher: "1 page"
+    "1-3 years": "1 page, 2 if justified"
+    "3-5 years": "1-2 pages"
+    "5-10 years / staff / principal": "2 pages"
+    manager: "2 pages"
+    "director / VP": "2-3 pages, employer rules win"
+    academic_cv: "varies widely (2-15+ pages) with the scholarly record -- do not compress arbitrarily"
+  never_shrink_to_fit: "Cut low-value content and strengthen evidence instead of dropping font size or margins to force a page count."
+
+header_contact:
+  include: [full name, city/state or city/country, professional email, phone, LinkedIn, GitHub/portfolio when relevant, Google Scholar/ORCID for research roles]
+  omit_by_default: [photo, date of birth/age, marital status, religion, national ID/passport numbers, full street address, unprofessional email, redundant social links]
+  note: "Only include an omitted field if the specific employer/country/portal explicitly requests it."
+
+summary_formula:
+  fresher: "Degree/discipline + target role + strongest relevant skills + one proof signal. 2-3 lines."
+  mid: "Role + domain + years + core stack + ownership + result. 2-4 lines."
+  senior: "Specialty + scope + cross-functional leadership + business/technical outcome. 3-4 lines."
+  executive: "Leadership identity + org/financial/technical scope + transformation/business outcomes + differentiator. 3-5 lines."
+  research: "Research identity + problem/methods + key contributions + publications/artifacts/funding + future direction. 3-5 lines."
+  avoid: ['"Seeking a challenging position where I can utilize my skills."', 'generic adjectives with no evidence ("results-oriented", "excellent communicator") unless backed by a bullet', "restating the entire Skills section"]
+
+bullet_formula:
+  pattern: "Action verb + what you built/changed/led + how/technology + measurable outcome + scope/context."
+  weak: "Responsible for developing APIs."
+  better: "Built REST APIs in Python/FastAPI for a customer workflow."
+  strong: "Built and optimized 18 Python/FastAPI endpoints, reducing median API latency 42% and supporting 3 product teams."
+  weak_openers_to_avoid: ["responsible for", "worked on", "helped with", "assisted with", "duties included", "tasked with"]
+  bullets_per_role: "3-6 for the most recent/relevant roles; fewer for older/less-relevant ones."
+  quantify_when_possible: [revenue/cost/savings/budget, users/traffic/data volume, latency/uptime/throughput/error rate, cycle time/deploy frequency, team size/headcount, publications/citations/grants/patents]
+  action_verbs:
+    technical: [Architected, Engineered, Automated, Refactored, Optimized, Migrated, Deployed, Instrumented, Secured, Debugged, Integrated, Scaled, Benchmarked, Containerized, Designed, Implemented]
+    management: [Led, Directed, Built, Transformed, Aligned, Coached, Hired, Mentored, Negotiated, Delivered, Prioritized, Governed, Restructured, Influenced]
+    research: [Investigated, Hypothesized, Evaluated, Modeled, Analyzed, Quantified, Validated, Synthesized, Reproduced, Published, Presented]
+
+skills_section:
+  - "Group logically by category (Languages | Frameworks | Cloud | Databases | DevOps | Data/ML | Security | Tools)."
+  - "Most relevant skills first; use the JD's exact terminology when truthful."
+  - "Never use proficiency bars/stars/percentages (e.g. 'Python -- 95%')."
+  - "Never list a technology the candidate cannot discuss technically."
+  - "Management roles: use a Core Competencies section (Product Strategy, P&L Ownership, Vendor Management, etc.) backed by evidence in Experience bullets, not a keyword wall."
+
+ats_and_keywords:
+  workflow:
+    - "Read the full JD; extract must-have vs nice-to-have requirements, tools, domain terms, responsibilities."
+    - "Map each requirement to real evidence in the candidate's background."
+    - "Use the employer's exact terminology (including acronyms) only where it truthfully describes the candidate's experience."
+    - "Put important terms in Skills AND, where natural, in Experience/Projects/Summary bullets -- not just listed once."
+    - "Remove keywords that can't be defended in an interview."
+  avoid: "Repeating a keyword many times with no context (e.g. 'AWS AWS cloud Terraform Kubernetes...'). Searchability without credibility does not help."
+  no_universal_ats_score: "Treat 'ATS score' as a heuristic, not a guaranteed pass/fail -- systems differ per employer."
+
+section_order_by_target:
+  technical_fresher: [Header, Education, Technical Skills, Projects, Internship/Experience, Certifications/Awards]
+  technical_mid: [Header, Summary, Technical Skills, Experience, Selected Projects/Leadership, Education, Certifications]
+  senior_staff_principal: [Header, Summary, Core Technical Competencies, Experience, Selected Technical Leadership/Projects, Education, Publications/Patents/Certifications]
+  it_manager: [Header, Leadership Summary, Core Competencies, Experience, Selected Programs/Transformations, Education, Certifications]
+  director_vp: [Header, Executive Profile, Leadership Competencies, Executive Experience, Selected Strategic Impact, Education, Affiliations]
+  academic_faculty: [Header, Research Profile/Interests, Education, Research Experience, Publications, Teaching, Grants/Funding, Presentations, Mentoring, Service, Awards, Skills, References]
+  research_scientist: [Header, Research Profile, Research Experience, Selected Contributions, Publications/Patents, Research Artifacts, Technical Skills, Education, Awards/Grants]
+
+career_stage_playbook:
+  fresher: "Education can sit near the top. Projects/internships/research substitute for limited work history. Show what was built, technologies used, and the result -- don't inflate coursework into work experience."
+  "~3 years": "Shift center of gravity from education to professional experience; show increasing ownership, not just task execution."
+  "~5 years": "Show technical depth plus influence (architecture, mentoring, cross-functional work). If moving toward management, show hiring/planning/stakeholder work."
+  director_vp: "Answer: what do you own, at what scale, what changed because of your leadership. Quantify team size, budget/P&L, revenue, geography. Compress older experience. Do not write it like a senior-engineer resume with 40 technologies."
+  technical_to_management_transition: "Keep architecture/technical judgment and mentoring; reduce implementation detail and tool inventories; increase hiring, planning, stakeholder influence, and business outcomes."
+
+academic_and_research:
+  - "Academic CVs are discipline- and institution-specific; compare against successful CVs in the same field/career stage rather than forcing a universal template."
+  - "Separate peer-reviewed papers, preprints, workshop papers, posters, and invited talks. Label 'under review'/'submitted' honestly -- never as accepted or published."
+  - "State grant roles precisely (PI, co-PI, investigator, fellowship)."
+  - "A research/teaching statement is not a second CV -- it explains trajectory and future direction; the CV stays the structured record."
+  - "For multi-author work, distinguish authorship from contribution; never imply sole ownership of collaborative work."
+
+difficult_situations:
+  employment_gaps: "Use accurate month/year dates -- never manipulate dates to hide a gap. If the gap had meaningful activity (study, caregiving, freelancing, certification), name it briefly and truthfully."
+  layoffs: "State it neutrally (e.g. 'role concluded following company-wide restructuring'). Never imply voluntary resignation if it wasn't, never blame the employer."
+  short_tenures: "Lead with the strongest evidence from the role rather than apologizing for tenure."
+  career_changes: "Use the summary to bridge old and new identity; prioritize transferable evidence (leadership, analysis, systems thinking, delivery)."
+  confidential_work: "Describe scale/impact/methodology without disclosing trade secrets, proprietary details, or classified specifics. Never invent a public number to replace a sensitive one."
+
+high_impact_mistakes:
+  - "One generic resume sent to every job instead of tailoring."
+  - "Keyword stuffing instead of evidence."
+  - "Dense paragraphs instead of scannable bullets."
+  - "Two-column/graphic-heavy design for ATS-sensitive applications."
+  - "Tiny fonts / narrow margins to force a page count."
+  - "Bullets describing duties, not outcomes."
+  - "Technology lists with no context of real use."
+  - "Old/irrelevant experience taking more space than recent, relevant work."
+  - "Inconsistent dates, tense, or punctuation."
+  - "Unverifiable or fabricated metrics."
+  - "Wrong document for the audience (academic CV for a corporate role, or vice versa)."
+  - "Wrong file format or a sloppy filename ('resume_final_final2.pdf')."
+
+final_quality_gate:
+  - "TARGET -- role/identity obvious within seconds."
+  - "RELEVANCE -- strongest evidence directly supports this opportunity."
+  - "EVIDENCE -- major claims show outcome/scale/scope, not just assertion."
+  - "PROGRESSION -- career growth and increasing responsibility are visible."
+  - "KEYWORDS -- important JD terminology present only where truthful."
+  - "READABILITY -- typography/spacing/hierarchy support fast scanning."
+  - "ATS SAFETY -- no essential info locked in graphics/tables/text boxes."
+  - "TRUTH -- nothing invented: metrics, tech, titles, dates, publications, certs, ownership."
+  - "CONSISTENCY -- resume, LinkedIn, portfolio, cover letter don't contradict each other."
+  - "SUBMISSION -- correct file type, filename, links, page count for the target portal."
+
+filename: "FirstName_LastName_Role_Resume.pdf (or .docx if the portal requires it). Never 'resume_final_final2.pdf'."

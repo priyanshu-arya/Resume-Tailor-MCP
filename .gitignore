@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Downloaded per the README setup step -- not committed (54MB binary).
+bin/tectonic
+
+# Personal resume data -- this is user-generated local state, not
+# example/sample content. Never commit your real resume, tailored
+# versions, job-description history, or generated exports.
+resources/master_resume.yaml
+data/versions/*
+data/jd_history/*
+data/exports/*
+output/
+!data/versions/.gitkeep
+!data/jd_history/.gitkeep
+!data/exports/.gitkeep

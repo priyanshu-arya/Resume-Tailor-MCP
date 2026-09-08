@@ -1,0 +1,109 @@
+# Resume layout templates. Each one is modeled on the real PDF sample sitting
+# next to this file (source_file) that the exporter can render into. Section
+# names must match top-level keys in the resume schema (see
+# data/master_resume.yaml) -- any section a template calls for that isn't
+# part of the schema (e.g. "achievements", "coursework") is listed for
+# documentation but silently skipped at render time.
+templates:
+  - id: full-stack-modern
+    name: Modern Full-Stack (colored headers, keyword-rich summary)
+    source_file: Template 1.pdf
+    layout:
+      sections: [summary, skills, experience, projects, certifications, education]
+      unsupported_sections: []
+      style: >
+        Colored section headers with a rule underneath, bold inline keyword
+        emphasis in the summary and bullets, skills shown as
+        "Category : comma, separated, list", certifications called out as
+        their own section, projects include a tech-stack line and source
+        link.
+    best_for:
+      keywords: [react, angular, vue, php, rest, mvc, html, css, javascript,
+                 node.js, express, full-stack, web]
+      experience_level: [mid]
+      resume_signals: [has_certifications]
+      notes: >
+        Full-stack / web developer JDs, and candidates who have
+        certifications worth surfacing via a keyword-dense summary
+        paragraph. 2-5 years of experience.
+
+  - id: classic-minimalist
+    name: Classic Minimalist (Jake's Resume style)
+    source_file: Template 2.pdf
+    layout:
+      sections: [summary, experience, projects, skills, education, certifications]
+      unsupported_sections: []
+      style: >
+        The only layout with a real LaTeX template behind it (lib/latex.py),
+        compiled to PDF with tectonic -- every other template here is
+        metadata-only (used for scoring/section-order in md/docx export, but
+        has no matching visual renderer yet). Centered header with contact
+        links, dense action-verb bullets, pipe-separated project tech
+        stacks, categorized technical skills. The most widely recognized
+        ATS-safe SWE resume format.
+    best_for:
+      keywords: [research, api, backend, full-stack, ci/cd, git, rest,
+                 microservices]
+      experience_level: [entry, mid]
+      resume_signals: [many_projects, research_experience]
+      notes: >
+        Research-adjacent or academically-flavored software engineering
+        JDs, or as a strong general default -- dense on substance, no
+        wasted space.
+
+  - id: student-achievements
+    name: Student / Achievements-Heavy
+    source_file: Template 3.pdf
+    layout:
+      sections: [education, experience, projects, skills]
+      unsupported_sections: [other_projects, achievements, coursework,
+                              positions_of_responsibility]
+      style: >
+        GPA shown next to degree, achievements rendered as a dense dated
+        list, relevant coursework and positions of responsibility called
+        out as their own sections.
+    best_for:
+      keywords: [intern, internship, new grad, graduate, campus]
+      experience_level: [intern, entry]
+      resume_signals: [many_achievements, coursework_relevant]
+      notes: >
+        Internship / new-grad JDs, or candidates whose achievements,
+        competitive-programming record, or coursework are as strong a
+        signal as work experience.
+
+  - id: generic-minimal
+    name: Generic Minimal (safe fallback)
+    source_file: Template 4.pdf
+    layout:
+      sections: [education, skills, experience, projects]
+      unsupported_sections: []
+      style: >
+        Plain and content-agnostic: no summary, no certifications, skill
+        categories listed as rows.
+    best_for:
+      keywords: []
+      experience_level: [entry, mid]
+      resume_signals: []
+      notes: >
+        Safe fallback when no other template scores a clear win -- works
+        for almost any JD without overcommitting to a style.
+
+  - id: metrics-driven
+    name: Metrics-Driven Professional
+    source_file: Template 5.pdf
+    layout:
+      sections: [education, experience, projects, skills]
+      unsupported_sections: []
+      style: >
+        GPA plus relevant coursework, heavily quantified bullets
+        (percentages, throughput, latency numbers), project tech stack
+        shown inline next to the project title.
+    best_for:
+      keywords: [scalable, microservices, performance, optimization,
+                 ci/cd, agile, cloud, machine learning, data, aws, azure,
+                 gcp]
+      experience_level: [mid, senior]
+      resume_signals: [quantified_bullets]
+      notes: >
+        JDs that emphasize measurable impact/scale, or candidates whose
+        bullets are already metrics-heavy.
