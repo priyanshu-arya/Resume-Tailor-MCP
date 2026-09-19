@@ -252,20 +252,22 @@ def recommend_template(jd_text: str, version: str = "master") -> dict:
 def export_resume(version: str = "master", format: str = "pdf", out_path: str | None = None, template: str = "auto", jd_text: str | None = None):
     """Export a resume version to a real file.
 
-    format="pdf" (the default) is the one to use whenever someone wants a
-    finished, tailored resume: it renders the Jake's-Resume-style LaTeX
-    template, compiles it to PDF with the bundled tectonic engine, and
-    returns BOTH the compiled PDF and its LaTeX source directly in this
-    tool's response -- there is nothing to go dig out of a folder
-    afterwards. (A copy of both files is still saved under data/exports/ as
-    a backup.)
+    ALWAYS compiles and returns the PDF + its LaTeX source directly in this
+    tool's response, no matter what `format` is -- there is nothing to go
+    dig out of a folder afterwards. The PDF is always rendered with the
+    Jake's-Resume-style `classic-minimalist` LaTeX template, since that's
+    the only layout with a real LaTeX/PDF renderer; if a different
+    `template` was requested it's noted in the response but the PDF still
+    gets produced. (Both files are also saved under data/exports/ as a
+    backup.)
 
-    Other formats: "tex" (just the LaTeX source, no compile), "docx", "md",
-    "txt" -- these return a dict with the saved file path instead.
+    Pass format="docx", "md", or "txt" to ALSO save the resume in that
+    format (section order/heading color follow `template` there) --
+    the PDF + LaTeX are still always included on top of it. format="tex"
+    just skips the docx/md/txt extra and returns the PDF + LaTeX alone,
+    same as the default format="pdf".
 
     template: a specific template id (see list_templates), or "auto" (default).
-    Only "classic-minimalist" has a real pdf/tex renderer today -- the other
-    templates only affect section order/heading color in docx/md/txt.
     Auto-selection needs a JD to score against -- pass jd_text, or it falls
     back to the classic-minimalist default template.
     """
@@ -280,46 +282,55 @@ def export_resume(version: str = "master", format: str = "pdf", out_path: str | 
 
     fmt = format.lower().lstrip(".")
 
-    if out_path is None:
-        EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-        out_path = str(EXPORT_DIR / f"{version}.{fmt}")
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+    pdf_out_path = out_path if (out_path and fmt == "pdf") else str(EXPORT_DIR / f"{version}.pdf")
 
-    if fmt == "pdf":
-        if template_id != "classic-minimalist":
-            raise ValueError(
-                f"Template '{template_id}' has no LaTeX/PDF renderer yet -- only "
-                "'classic-minimalist' does. Pass template='classic-minimalist', "
-                "or use format='docx'/'md'/'txt' for the other layouts."
-            )
-        tex_source = _export.to_tex(resume, template_id)
-        pdf_path = _export.to_pdf(resume, out_path, template_id)
-        pdf_bytes = Path(pdf_path).read_bytes()
+    pdf_render_template = "classic-minimalist"
+    tex_source = _export.to_tex(resume, pdf_render_template)
+    pdf_path = Path(_export.to_pdf(resume, pdf_out_path, pdf_render_template)).resolve()
+    tex_path = pdf_path.with_suffix(".tex")
+    pdf_bytes = pdf_path.read_bytes()
 
-        summary = {
-            "template": template_id,
-            "pdf_path": pdf_path,
-            "tex_path": str(Path(pdf_path).with_suffix(".tex")),
-        }
-        return [
-            types.TextContent(
-                type="text",
-                text=(
-                    f"```json\n{json.dumps(summary, indent=2)}\n```\n\n"
-                    f"LaTeX source:\n\n```latex\n{tex_source}\n```"
-                ),
+    summary = {"template": pdf_render_template, "pdf_path": str(pdf_path), "tex_path": str(tex_path)}
+
+    extra_note = ""
+    extra_file_line = ""
+    if fmt not in ("pdf", "tex"):
+        extra_out_path = out_path or str(EXPORT_DIR / f"{version}.{fmt}")
+        extra_path = Path(_export_resume(resume, extra_out_path, fmt, template_id)).resolve()
+        summary[f"{fmt}_path"] = str(extra_path)
+        extra_file_line = f"Also saved {fmt}: {extra_path}\n"
+    if template_id != pdf_render_template:
+        extra_note = (
+            f"(Requested template '{template_id}' has no LaTeX/PDF renderer yet, so the PDF/LaTeX "
+            f"above used '{pdf_render_template}' instead"
+            + (f"; the {fmt} file above still uses '{template_id}'.)\n" if fmt not in ("pdf", "tex") else ".)\n")
+        )
+
+    return [
+        types.TextContent(
+            type="text",
+            text=(
+                f"Saved PDF to: {pdf_path}\n"
+                f"Saved LaTeX to: {tex_path}\n"
+                f"{extra_file_line}"
+                "(If the PDF doesn't appear as an attachment above in this chat, "
+                "open it directly from that path -- some MCP clients don't render "
+                "embedded file blobs inline.)\n"
+                f"{extra_note}\n"
+                f"```json\n{json.dumps(summary, indent=2)}\n```\n\n"
+                f"LaTeX source:\n\n```latex\n{tex_source}\n```"
             ),
-            types.EmbeddedResource(
-                type="resource",
-                resource=types.BlobResourceContents(
-                    uri=f"file://{Path(pdf_path).resolve()}",
-                    mimeType="application/pdf",
-                    blob=base64.b64encode(pdf_bytes).decode("ascii"),
-                ),
+        ),
+        types.EmbeddedResource(
+            type="resource",
+            resource=types.BlobResourceContents(
+                uri=f"file://{pdf_path}",
+                mimeType="application/pdf",
+                blob=base64.b64encode(pdf_bytes).decode("ascii"),
             ),
-        ]
-
-    saved_path = _export_resume(resume, out_path, fmt, template_id)
-    return {"format": fmt, "path": saved_path, "template": template_id}
+        ),
+    ]
 
 
 @mcp.tool()
@@ -352,7 +363,7 @@ def tailor_resume_workflow(jd_text: str, company: str = "", role: str = "") -> s
 5. Call tailor_resume with save_as="{suggested_id}" (or a better id you choose), the full updated resume dict, and this jd_text so I get an updated match score back.
 6. Call score_ats on the new version to check formatting and etiquette issues (weak openers, generic summary phrases, unnecessary personal identifiers, quantification, bullet density).
 7. Show me a summary: before/after match score, what changed, and any remaining ATS/etiquette issues.
-8. Call export_resume with format="pdf" (the default) and this jd_text. It returns the compiled PDF and its LaTeX source directly in the tool result -- put the LaTeX source in your reply as a ```latex code block, and make sure the PDF comes through to me in the chat. Do not just tell me a file path and stop there.
+8. MANDATORY, not optional: call export_resume with format="pdf" (the default) and this jd_text. It returns the compiled PDF and its LaTeX source directly in the tool result. Deliver BOTH in your reply -- the PDF as the actual attached/embedded file, and the LaTeX source as a ```latex code block -- every time I ask you to tailor a resume/CV to a JD. Saving a version with tailor_resume is not the deliverable; the PDF + LaTeX are. Never stop at a file path or a prose description of the changes.
 
 Here is the job description:
 

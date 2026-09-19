@@ -56,7 +56,7 @@ SECTION_ALIASES = {
 def _empty_resume():
     return {
         "name": "",
-        "contact": {"email": "", "phone": "", "linkedin": "", "location": ""},
+        "contact": {"email": "", "phone": "", "website": "", "linkedin": "", "github": "", "substack": "", "location": ""},
         "summary": "",
         "skills": [],
         "experience": [],
@@ -88,12 +88,19 @@ def parse_markdown(text: str) -> dict:
         if "@" in contact_line or "|" in contact_line:
             parts = [p.strip() for p in contact_line.split("|")]
             for p in parts:
+                low = p.lower()
                 if "@" in p:
                     resume["contact"]["email"] = p
-                elif re.search(r"\d{3}", p) and "linkedin" not in p.lower():
-                    resume["contact"]["phone"] = p
-                elif "linkedin" in p.lower() or "github" in p.lower():
+                elif "linkedin" in low:
                     resume["contact"]["linkedin"] = p
+                elif "github" in low:
+                    resume["contact"]["github"] = p
+                elif "substack" in low:
+                    resume["contact"]["substack"] = p
+                elif re.search(r"\d{3}", p):
+                    resume["contact"]["phone"] = p
+                elif re.match(r"^(https?://)?(www\.)?[\w.-]+\.[a-z]{2,}(/\S*)?$", low):
+                    resume["contact"]["website"] = p
                 else:
                     resume["contact"]["location"] = p
             idx += 1

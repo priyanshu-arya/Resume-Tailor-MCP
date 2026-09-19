@@ -1,11 +1,13 @@
 """Render the structured resume out to a real file: .md, .txt, .docx, .tex, .pdf."""
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 from lib import templates as _templates
 from lib import latex as _latex
+from lib.links import linkedin_label, normalize_url
 
 TECTONIC_BIN = Path(__file__).resolve().parent.parent / "bin" / "tectonic"
 
@@ -72,7 +74,10 @@ def _md_projects(resume: dict) -> list[str]:
         return []
     lines = ["## Projects"]
     for proj in resume["projects"]:
-        lines.append(f"### {proj.get('name', '')}")
+        name = proj.get("name", "")
+        github = proj.get("github")
+        heading = f"[{name}]({normalize_url(github)})" if github else name
+        lines.append(f"### {heading}")
         for b in _bullets_text(proj.get("bullets")):
             lines.append(f"- {b}")
     lines.append("")
@@ -99,10 +104,32 @@ _MD_SECTION_RENDERERS = {
 }
 
 
+def _md_contact_line(contact: dict) -> str:
+    parts = []
+    if contact.get("phone"):
+        parts.append(contact["phone"])
+    if contact.get("email"):
+        parts.append(f"[{contact['email']}](mailto:{contact['email']})")
+    if contact.get("website"):
+        url = contact["website"]
+        parts.append(f"[{url}]({normalize_url(url)})")
+    if contact.get("linkedin"):
+        url = contact["linkedin"]
+        parts.append(f"[{linkedin_label(url)}]({normalize_url(url)})")
+    if contact.get("github"):
+        url = contact["github"]
+        parts.append(f"[{url}]({normalize_url(url)})")
+    if contact.get("substack"):
+        url = contact["substack"]
+        parts.append(f"[{url}]({normalize_url(url)})")
+    if contact.get("location"):
+        parts.append(contact["location"])
+    return " | ".join(parts)
+
+
 def to_markdown(resume: dict, template_id: str | None = None) -> str:
     lines = [f"# {resume.get('name', '')}"]
-    contact = resume.get("contact", {})
-    contact_line = " | ".join(v for v in [contact.get("email"), contact.get("phone"), contact.get("linkedin"), contact.get("github"), contact.get("substack"), contact.get("location")] if v)
+    contact_line = _md_contact_line(resume.get("contact", {}) or {})
     if contact_line:
         lines.append(contact_line)
     lines.append("")
@@ -113,18 +140,98 @@ def to_markdown(resume: dict, template_id: str | None = None) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _flatten_md_link(match: re.Match) -> str:
+    text, url = match.group(1), match.group(2)
+    bare = url.removeprefix("mailto:").removeprefix("https://").removeprefix("http://")
+    # Skip the redundant "(url)" when the visible text already *is* the URL
+    # (plain email/website/github links) -- keep it for short labels like
+    # the "in/username" LinkedIn label or a project name, where it adds info.
+    return text if text == bare else f"{text} ({url})"
+
+
 def to_txt(resume: dict, template_id: str | None = None) -> str:
     # Plain text is the safest possible ATS format -- strip markdown symbols.
     md = to_markdown(resume, template_id)
-    return "\n".join(
-        line.lstrip("#").lstrip("-").strip() if line.strip() else ""
-        for line in md.splitlines()
-    )
+    lines = []
+    for line in md.splitlines():
+        line = _MD_LINK_RE.sub(_flatten_md_link, line)
+        lines.append(line.lstrip("#").lstrip("-").strip() if line.strip() else "")
+    return "\n".join(lines)
 
 
 # Templates whose source layout uses colored section headers (see
 # data/templates/templates.yaml) get that color in the .docx export too.
 _HEADING_COLOR_BY_TEMPLATE = {"full-stack-modern": (0x1F, 0x4E, 0x79)}
+
+
+def _add_hyperlink(paragraph, url: str, text: str, bold: bool = False):
+    """Insert a real clickable hyperlink run into a docx paragraph.
+    python-docx has no built-in hyperlink API, so this builds the
+    w:hyperlink OOXML element directly."""
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.opc.constants import RELATIONSHIP_TYPE
+
+    part = paragraph.part
+    r_id = part.relate_to(url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True)
+
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), r_id)
+
+    run = OxmlElement("w:r")
+    rpr = OxmlElement("w:rPr")
+    if bold:
+        rpr.append(OxmlElement("w:b"))
+    color = OxmlElement("w:color")
+    color.set(qn("w:val"), "0563C1")
+    rpr.append(color)
+    underline = OxmlElement("w:u")
+    underline.set(qn("w:val"), "single")
+    rpr.append(underline)
+    run.append(rpr)
+
+    t = OxmlElement("w:t")
+    t.text = text
+    run.append(t)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+    return hyperlink
+
+
+def _docx_contact_line(document, contact: dict) -> None:
+    parts: list[tuple[str, str, str | None]] = []
+    if contact.get("phone"):
+        parts.append(("text", contact["phone"], None))
+    if contact.get("email"):
+        parts.append(("link", contact["email"], f"mailto:{contact['email']}"))
+    if contact.get("website"):
+        url = contact["website"]
+        parts.append(("link", url, normalize_url(url)))
+    if contact.get("linkedin"):
+        url = contact["linkedin"]
+        parts.append(("link", linkedin_label(url), normalize_url(url)))
+    if contact.get("github"):
+        url = contact["github"]
+        parts.append(("link", url, normalize_url(url)))
+    if contact.get("substack"):
+        url = contact["substack"]
+        parts.append(("link", url, normalize_url(url)))
+    if contact.get("location"):
+        parts.append(("text", contact["location"], None))
+
+    if not parts:
+        return
+    p = document.add_paragraph()
+    for i, (kind, label, href) in enumerate(parts):
+        if i > 0:
+            p.add_run("  |  ")
+        if kind == "link":
+            _add_hyperlink(p, href, label)
+        else:
+            p.add_run(label)
 
 
 def _docx_heading(document, text: str, template_id: str | None):
@@ -175,7 +282,11 @@ def _docx_projects(document, resume: dict, template_id: str | None) -> None:
         _docx_heading(document, "Projects", template_id)
         for proj in resume["projects"]:
             p = document.add_paragraph()
-            p.add_run(proj.get("name", "")).bold = True
+            github = proj.get("github")
+            if github:
+                _add_hyperlink(p, normalize_url(github), proj.get("name", ""), bold=True)
+            else:
+                p.add_run(proj.get("name", "")).bold = True
             for b in _bullets_text(proj.get("bullets")):
                 document.add_paragraph(b, style="List Bullet")
 
@@ -212,10 +323,7 @@ def to_docx(resume: dict, out_path: str, template_id: str | None = None) -> str:
     style.font.size = Pt(10.5)
 
     document.add_heading(resume.get("name", ""), level=1)
-    contact = resume.get("contact", {})
-    contact_line = " | ".join(v for v in [contact.get("email"), contact.get("phone"), contact.get("linkedin"), contact.get("github"), contact.get("substack"), contact.get("location")] if v)
-    if contact_line:
-        document.add_paragraph(contact_line)
+    _docx_contact_line(document, resume.get("contact", {}) or {})
 
     for section in order:
         _DOCX_SECTION_RENDERERS[section](document, resume, template_id)

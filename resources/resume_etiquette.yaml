@@ -138,3 +138,23 @@ final_quality_gate:
   - "SUBMISSION -- correct file type, filename, links, page count for the target portal."
 
 filename: "FirstName_LastName_Role_Resume.pdf (or .docx if the portal requires it). Never 'resume_final_final2.pdf'."
+
+delivery_requirements:
+  tailor_or_cv_request: >
+    Whenever the user asks to tailor a resume/CV to a job description (or
+    otherwise asks for a finished tailored resume/CV, in any phrasing --
+    "tailor my resume for this JD", "make me a CV for this role", etc.), the
+    task is not done until export_resume has been called and its response
+    delivered in full: the compiled PDF (as the embedded/attached file) AND
+    its LaTeX source (as a ```latex code block in the reply). Never stop at
+    just saving a version with tailor_resume, describing the changes in
+    prose, or handing back a file path with no attachment/code block.
+  linking: >
+    Contact links (email, website/portfolio, LinkedIn, GitHub, Substack) are
+    always rendered as real hyperlinks, not bare text -- LinkedIn shows a
+    short label (e.g. "in/username") hyperlinked to the full profile URL.
+    Any project with a known public repo (a "github" field on that project
+    in the master resume) gets its project name hyperlinked to that repo.
+    Never invent a repo URL for a project that doesn't have one recorded --
+    that violates the golden rule above; ask the candidate for the link or
+    leave the project name as plain text instead.

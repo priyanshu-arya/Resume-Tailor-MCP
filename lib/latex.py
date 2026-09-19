@@ -6,6 +6,8 @@ straight from this generated .tex, so the two can never drift apart.
 
 from __future__ import annotations
 
+from lib.links import linkedin_label, normalize_url
+
 _SPECIAL_CHARS = {
     "\\": r"\textbackslash{}",
     "&": r"\&",
@@ -107,18 +109,18 @@ def _header(resume: dict) -> str:
     if contact.get("email"):
         email = contact["email"]
         parts.append(rf"\href{{mailto:{email}}}{{\underline{{{esc(email)}}}}}")
+    if contact.get("website"):
+        url = contact["website"]
+        parts.append(rf"\href{{{normalize_url(url)}}}{{\underline{{{esc(url)}}}}}")
     if contact.get("linkedin"):
         url = contact["linkedin"]
-        href = url if url.startswith("http") else f"https://{url}"
-        parts.append(rf"\href{{{href}}}{{\underline{{{esc(url)}}}}}")
+        parts.append(rf"\href{{{normalize_url(url)}}}{{\underline{{{esc(linkedin_label(url))}}}}}")
     if contact.get("github"):
         url = contact["github"]
-        href = url if url.startswith("http") else f"https://{url}"
-        parts.append(rf"\href{{{href}}}{{\underline{{{esc(url)}}}}}")
+        parts.append(rf"\href{{{normalize_url(url)}}}{{\underline{{{esc(url)}}}}}")
     if contact.get("substack"):
         url = contact["substack"]
-        href = url if url.startswith("http") else f"https://{url}"
-        parts.append(rf"\href{{{href}}}{{\underline{{{esc(url)}}}}}")
+        parts.append(rf"\href{{{normalize_url(url)}}}{{\underline{{{esc(url)}}}}}")
     if contact.get("location"):
         parts.append(esc(contact["location"]))
 
@@ -168,8 +170,10 @@ def _section_projects(resume: dict) -> str:
     lines = ["\\section{Projects}", "    \\resumeSubHeadingListStart"]
     for proj in resume["projects"]:
         name = esc(proj.get("name", ""))
+        github = proj.get("github")
+        name_tex = rf"\href{{{normalize_url(github)}}}{{\textbf{{{name}}}}}" if github else f"\\textbf{{{name}}}"
         stack = proj.get("stack") or proj.get("tech_stack")
-        title = f"\\textbf{{{name}}}"
+        title = name_tex
         if stack:
             title += f" $|$ \\emph{{{esc(stack)}}}"
         dates = esc(proj.get("dates", ""))
