@@ -10,6 +10,7 @@ bin/tectonic
 # example/sample content. Never commit your real resume, tailored
 # versions, job-description history, or generated exports.
 resources/master_resume.yaml
+resources/master_cv.yaml
 data/versions/*
 data/jd_history/*
 data/exports/*

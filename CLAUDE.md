@@ -1,5 +1,24 @@
 # Resume Tailor MCP -- project rules
 
+## Master files: Resume and CV are separate documents
+
+`resume` and `cv` are two independent canonical master documents, never
+merged: `resources/master_resume.yaml` and `resources/master_cv.yaml`.
+Every tool that touches a master takes a `kind` argument (`parse_resume`,
+`get_master_resume`; default `"resume"`), and both are readable via
+`resume://master/{kind}` (`resume://master` stays as a `resume`-kind alias).
+Tailored versions and exports still use one shared `data/versions/` and
+`data/exports/` -- only the two masters are kept separate, distinguished by
+filename.
+
+When the user has no master of the relevant kind yet and asks to create one
+from scratch or from an existing file, use the `create-master-file` skill
+(`.claude/skills/create-master-file/SKILL.md`) -- it covers which kind to
+build, protecting an existing master from accidental overwrite, and the
+required master `.tex`/`.pdf` validation before tailoring is allowed to
+start. `create-cv` remains the from-scratch interview flow that
+`create-master-file` delegates to for gathering content.
+
 ## Tailoring a resume/CV to a job description
 
 Whenever the user asks to tailor their resume/CV to a job description, or
@@ -84,6 +103,7 @@ any project with a `github` field render as real hyperlinks across every
 export format (PDF/LaTeX, docx, md) -- see `lib/links.py`, `lib/latex.py`,
 `lib/export.py`. LinkedIn displays a short label ("in/username") hyperlinked
 to the full profile URL. Never fabricate a project's `github` link -- only
-add one to `resources/master_resume.yaml` when you've verified the repo
-actually exists (e.g. from a local git remote or the candidate confirming
-it); otherwise leave the project name as plain text.
+add one to `resources/master_resume.yaml` (or `resources/master_cv.yaml`)
+when you've verified the repo actually exists (e.g. from a local git remote
+or the candidate confirming it); otherwise leave the project name as plain
+text.

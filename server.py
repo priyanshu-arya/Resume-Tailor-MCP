@@ -40,13 +40,30 @@ ETIQUETTE_PATH = Path(__file__).resolve().parent / "resources" / "resume_etiquet
 # Resources -- read-only, URI-addressable state
 # --------------------------------------------------------------------------
 
+def _dump_master(kind: str) -> str:
+    resume = storage.load_master(kind)
+    if resume is None:
+        return (
+            f"# No master {kind} yet.\n"
+            f"# Use the parse_resume tool (kind='{kind}'), the create-master-file skill, "
+            f"or edit {storage.MASTER_PATHS[kind]} directly."
+        )
+    return yaml.safe_dump(resume, sort_keys=False, allow_unicode=True)
+
+
 @mcp.resource("resume://master")
 def resource_master_resume() -> str:
     """The current master (canonical) resume as YAML."""
-    resume = storage.load_master()
-    if resume is None:
-        return "# No master resume yet.\n# Use the parse_resume tool to import one, or edit resources/master_resume.yaml directly."
-    return yaml.safe_dump(resume, sort_keys=False, allow_unicode=True)
+    return _dump_master("resume")
+
+
+@mcp.resource("resume://master/{kind}")
+def resource_master_by_kind(kind: str) -> str:
+    """The current master document as YAML. kind: 'resume' or 'cv' -- these
+    are two separate canonical documents, never mixed."""
+    if kind not in ("resume", "cv"):
+        return f"# Unknown master kind '{kind}'. Use 'resume' or 'cv'."
+    return _dump_master(kind)
 
 
 @mcp.resource("resume://sections/{name}")
@@ -111,18 +128,25 @@ def resource_etiquette() -> str:
 # --------------------------------------------------------------------------
 
 @mcp.tool()
-def parse_resume(file_path: str) -> dict:
-    """Parse a resume file (.md, .txt, .docx, or .pdf) into the structured
-    format and save it as the master resume (resources/master_resume.yaml).
+def parse_resume(file_path: str, kind: str = "resume") -> dict:
+    """Parse a resume/CV file (.md, .txt, .docx, or .pdf) into the structured
+    format and save it as the master document.
 
-    This OVERWRITES the current master resume. If you already have one and
-    just want to try a different source file, back up resources/master_resume.yaml
-    first (or check resume://versions for anything you've already saved).
+    kind: "resume" (default, saved to resources/master_resume.yaml) or "cv"
+    (saved to resources/master_cv.yaml). Resume and CV are two separate
+    canonical documents -- never mix their content into one file.
+
+    This OVERWRITES the current master for that kind. If one already
+    exists, confirm with the user before calling this rather than silently
+    replacing it (or check resume://versions for anything already saved).
     """
+    if kind not in ("resume", "cv"):
+        raise ValueError("kind must be 'resume' or 'cv'")
     resume = parsing.parse_resume_file(file_path)
-    storage.save_master(resume)
+    storage.save_master(resume, kind)
     return {
-        "saved_to": str(storage.MASTER_PATH),
+        "kind": kind,
+        "saved_to": str(storage.MASTER_PATHS[kind]),
         "name": resume.get("name"),
         "sections_found": [
             k for k in ("summary", "skills", "experience", "education", "projects", "certifications")
@@ -161,11 +185,15 @@ def match_resume_to_jd(jd_text: str, version: str = "master") -> dict:
 
 
 @mcp.tool()
-def get_master_resume() -> dict:
-    """Return the full structured master resume as a dict, for editing."""
-    resume = storage.load_master()
+def get_master_resume(kind: str = "resume") -> dict:
+    """Return the full structured master document as a dict, for editing.
+
+    kind: "resume" or "cv" -- these are two separate canonical documents."""
+    if kind not in ("resume", "cv"):
+        raise ValueError("kind must be 'resume' or 'cv'")
+    resume = storage.load_master(kind)
     if resume is None:
-        raise ValueError("No master resume yet. Run parse_resume first.")
+        raise ValueError(f"No master {kind} yet. Run parse_resume(kind='{kind}') first, or use the create-master-file skill.")
     return resume
 
 

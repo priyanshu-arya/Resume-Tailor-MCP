@@ -89,6 +89,7 @@ flowchart TB
         
         subgraph ResourcesLayer["MCP Resources"]
             R1["resume://master"]
+            R1b["resume://master/{kind}\n(resume | cv)"]
             R2["resume://sections/{name}"]
             R3["resume://versions/{id}"]
             R4["resume://templates"]
@@ -197,8 +198,8 @@ mkdir -p bin && tar -xzf /tmp/tectonic.tar.gz -C bin && chmod +x bin/tectonic
 ### 3. Add Your Master Resume
 
 You have two options:
-1. **Automated Import**: Place your existing `.pdf`, `.docx`, or `.md` resume on your machine and ask your AI assistant to run `parse_resume(file_path="/path/to/resume.pdf")`.
-2. **Direct YAML Editing**: Edit `resources/master_resume.yaml` directly using any text editor.
+1. **Automated Import**: Place your existing `.pdf`, `.docx`, or `.md` resume/CV on your machine and ask your AI assistant to run `parse_resume(file_path="/path/to/resume.pdf")`. Pass `kind="cv"` instead of the default `kind="resume"` if you're importing an academic/research CV -- resume and CV are kept as two separate master documents, never merged.
+2. **Direct YAML Editing**: Edit `resources/master_resume.yaml` (or `resources/master_cv.yaml`) directly using any text editor.
 
 ---
 
@@ -331,6 +332,7 @@ resume-tailor-mcp/
 │   └── tectonic                # Bundled standalone TeX compiler (downloaded once)
 ├── resources/
 │   ├── master_resume.yaml      # 🌟 YOUR CANONICAL RESUME (edit or parse into this)
+│   ├── master_cv.yaml          # 🌟 YOUR CANONICAL CV -- separate document, kind="cv"
 │   ├── resume_etiquette.yaml   # Ivy League / ATS formatting rules & quality gates
 │   └── templates/              # Layout definitions (Classic Minimalist, etc.)
 ├── data/
@@ -524,7 +526,8 @@ Keep tailored resumes organized per company and date. You can review the exact u
 | URI | Description | Output Format |
 | :--- | :--- | :--- |
 | `resume://master` | Canonical master resume. | YAML |
-| `resume://sections/{name}` | Individual section (`summary`, `skills`, `experience`, `education`, `projects`, `certifications`, `contact`). | YAML |
+| `resume://master/{kind}` | Canonical master document by kind (`resume` or `cv`). | YAML |
+| `resume://sections/{name}` | Individual section (`summary`, `skills`, `experience`, `education`, `projects`, `certifications`, `contact`) of the master resume. | YAML |
 | `resume://versions/{version_id}` | Previously saved tailored resume version. | YAML |
 | `resume://templates` | List of all available layout templates and matching notes. | YAML |
 | `resume://templates/{template_id}` | Detailed metadata and configuration for a specific template. | YAML |
@@ -537,8 +540,8 @@ Keep tailored resumes organized per company and date. You can review the exact u
 
 | Tool Name | Parameters | Description |
 | :--- | :--- | :--- |
-| `parse_resume` | `file_path: str` | Parses a `.pdf`, `.docx`, `.md`, or `.txt` resume into the structured master schema. |
-| `get_master_resume` | *None* | Retrieves the complete master resume dictionary for editing. |
+| `parse_resume` | `file_path: str`, `kind: str = "resume"` | Parses a `.pdf`, `.docx`, `.md`, or `.txt` file into the structured master schema and saves it as the master resume (`kind="resume"`) or master CV (`kind="cv"`) -- two separate canonical documents. |
+| `get_master_resume` | `kind: str = "resume"` | Retrieves the complete master resume or master CV dictionary for editing. |
 | `extract_jd_keywords` | `jd_text: str`, `save_as: str?` | Deterministically extracts must-have/nice-to-have keywords, seniority, and years of experience. |
 | `match_resume_to_jd` | `jd_text: str`, `version: str = "master"` | Computes keyword gap analysis (`matched`, `missing`, `weak`) and score. |
 | `tailor_resume` | `save_as: str`, `resume: dict`, `jd_text: str?`, `source_version: str = "master"` | Validates and saves a new tailored resume version. |
