@@ -158,3 +158,72 @@ delivery_requirements:
     Never invent a repo URL for a project that doesn't have one recorded --
     that violates the golden rule above; ask the candidate for the link or
     leave the project name as plain text instead.
+
+# ---------------------------------------------------------------------------
+# v2 truth-enforcement rules (machine-read by lib/rules.py and enforced by
+# lib/validators/provenance.py). Claude may optimize wording; Python decides
+# what is true. Edit these here -- there is no second copy in the code.
+# ---------------------------------------------------------------------------
+
+# Stamped into every saved tailored version; bump when any rule below changes.
+rules_version: "2026.09-v2.0"
+
+# Categories a piece of evidence can carry (same vocabulary as claim_strength).
+evidence_categories: [professional, internship, personal_project, academic, coursework, certification, learning_only, none]
+# allowed-claim order (NOT a ranking of the candidate):
+#   professional > internship > personal_project ~= academic > coursework > certification > learning_only > none
+
+# Where each evidence category may be cited: section -> yes | limited | no.
+# master_skill = an item of the master's own Skills section; master_summary =
+# the master's own summary (citable only by a rewritten summary).
+# Unknown categories/sections are treated as "no" (fail closed). Values are
+# quoted because bare yes/no are YAML 1.1 booleans.
+evidence_placement:
+  professional:     {experience: "yes", projects: "yes", skills: "yes", summary: "yes", education: "no"}
+  internship:       {experience: "yes", projects: "yes", skills: "yes", summary: "yes", education: "no"}
+  personal_project: {experience: "no", projects: "yes", skills: "yes", summary: "limited", education: "no"}
+  academic:         {experience: "no", projects: "yes", skills: "yes", summary: "limited", education: "yes"}
+  coursework:       {experience: "no", projects: "limited", skills: "yes", summary: "no", education: "yes"}
+  certification:    {experience: "no", projects: "no", skills: "yes", summary: "limited", education: "no"}
+  learning_only:    {experience: "no", projects: "no", skills: "limited", summary: "no", education: "no"}
+  none:             {experience: "no", projects: "no", skills: "no", summary: "no", education: "no"}
+  master_skill:     {experience: "no", projects: "no", skills: "yes", summary: "no", education: "no"}
+  master_summary:   {experience: "no", projects: "no", skills: "no", summary: "yes", education: "no"}
+
+# What "limited" means -- enforced by lib/validators/provenance.py.
+placement_wording:
+  limited: "Only low-scope wording: no high-scope verbs, no metrics. In Skills, 'limited' means the item must sit in a familiarity group (category name containing one of familiarity_group_markers)."
+  internship_in_experience: "Internship evidence stays under the internship role; never presented as full-time professional ownership."
+
+# A skill group whose category name contains one of these (case-insensitive)
+# is a familiarity group, e.g. "Familiar With", "Currently Learning".
+familiarity_group_markers: [familiar, familiarity, learning, exposure]
+
+# Verb scope. `safe` verbs describe hands-on work any evidence category may
+# support. `high_scope` is a list of verb FAMILIES: a family used in new text
+# must also appear (in any listed form) in a cited source text. Bare forms that
+# are common nouns/adjectives ("own", "scale", "drive", "head", "direct") are
+# deliberately left out to avoid false positives.
+verb_scope:
+  safe: [built, created, implemented, developed, deployed, configured, tested, designed, wrote, integrated, automated, analyzed, trained, evaluated, documented, maintained, migrated, optimized, refactored, contributed]
+  high_scope:
+    - [led, lead, leads, leading]
+    - [owned, owning]
+    - [architected, architecting]
+    - [drove, driving]
+    - [scaled, scaling]
+    - [managed, manage, manages, managing]
+    - [directed, directing]
+    - [spearheaded, spearheading]
+    - [headed]
+    - [oversaw, oversee, oversees, overseeing, overseen]
+    - [supervised, supervise, supervises, supervising]
+    - [mentored, mentor, mentors, mentoring]
+
+claim_rules:
+  - "claim_strength must not exceed the strongest cited evidence category."
+  - "Every cited source's category must be allowed in the target section (evidence_placement)."
+  - "A high_scope verb requires the same verb (any listed form of it) in a cited source text."
+  - "Every technology detected in new text must be present in a cited source text or be the term of cited evidence."
+  - "Every number/metric in new text must appear in a cited master text or in the metrics of cited evidence."
+  - "learning_only skills only in a familiarity group; never in Experience, Projects or Summary."

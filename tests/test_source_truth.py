@@ -54,7 +54,7 @@ def test_previous_version_cannot_be_cited_or_used_as_source(master):
     ws, _, _ = master
     wf = _wf(ws)
     first = tailoring.tailor("v1", [{"operation": "add_block", "parent_id": "exp-001", "new_content": {
-        "text": "Implemented unit tests with pytest.", "source_refs": [{"type": "master", "id": "exp-002-b01"}]}}],
+        "text": "Built Python REST endpoints.", "source_refs": [{"type": "master", "id": "exp-001-b01"}]}}],
         workflow_id=wf)
     new_id = first["new_block_ids"][0]
     with pytest.raises(ResumeTailorError) as e:

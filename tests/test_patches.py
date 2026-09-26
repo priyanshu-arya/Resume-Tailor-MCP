@@ -442,10 +442,20 @@ def test_ref_to_block_dropped_in_body_is_still_citable(m):
     validate_and_apply(m, [drop("exp-002"), add_block("exp-001", refs=[_mref("exp-002-b01")])], workflow_id=WF)
 
 
-@pytest.mark.parametrize("ref", ["sum-001", "skg-001"])
+@pytest.mark.parametrize("ref", ["skg-001"])
 def test_uncitable_ref(m, ref):
     with pytest.raises(ResumeTailorError) as exc:
         validate_and_apply(m, [replace("exp-001-b01", refs=[_mref(ref)])], workflow_id=WF)
+    assert _rules(exc) == ["provenance.uncitable_ref"]
+
+
+def test_master_summary_is_citable_but_empty_summary_is_not(m):
+    # a non-empty master summary may back a rewritten summary (placement is
+    # enforced by the provenance hook, not here)
+    validate_and_apply(m, [replace("sum-001", refs=[_mref("sum-001")])], workflow_id=WF)
+    empty = dict(m, summary="")
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(empty, [replace("exp-001-b01", refs=[_mref("sum-001")])], workflow_id=WF)
     assert _rules(exc) == ["provenance.uncitable_ref"]
 
 
@@ -657,7 +667,7 @@ def test_hook_ctx_contents(m):
     c = seen[0]
     assert c == {
         "patch_index": 1, "operation": "replace_block", "target_type": "experience_bullet",
-        "target_section": "experience", "skill_group_category": None, "text": "Did X.",
+        "target_section": "experience", "skill_group_category": None, "parent_category": "professional", "text": "Did X.",
         "source_refs": [_mref("exp-001-b01"), _eref("ev-001")], "claim_strength": "professional",
         "ref_infos": [
             {"type": "master", "id": "exp-001-b01", "category": "professional",

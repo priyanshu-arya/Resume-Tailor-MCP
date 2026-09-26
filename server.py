@@ -32,7 +32,6 @@ from lib.ids import normalize_master
 from lib.schemas import validate_kind
 from lib import templates as _templates
 from lib import export as _export
-from lib.keywords import extract_jd_keywords as _extract_jd_keywords
 from lib.matching import match_resume_to_jd as _match_resume_to_jd
 from lib.ats import score_ats as _score_ats
 from lib.export import export_resume as _export_resume
@@ -260,17 +259,36 @@ def set_master_resume(kind: str, file_path: str | None = None, resume: dict | No
 
 @mcp.tool()
 @_safe_tool
-def extract_jd_keywords(jd_text: str, save_as: str | None = None) -> dict:
-    """Extract must-have / nice-to-have keywords, title, seniority, and
-    years-of-experience signal from a pasted job description.
+def analyze_tailoring_requirements(jd_text: str, source_kind: str = "resume", workflow_id: str | None = None) -> dict:
+    """STEP 1 of tailoring. Starts a workflow (or reuses workflow_id) and
+    compares the JD with the workspace master: confirmed / weak / missing
+    requirements, priority_missing, unknown_requirements and
+    evidence_prompts. Ask the user each evidence prompt in your own words --
+    never answer for them, and never assume an answer from memory or earlier
+    conversations. Keep the returned workflow_id for every later step."""
+    from lib import evidence
+    return evidence.analyze_requirements(jd_text, source_kind=source_kind, workflow_id=workflow_id)
 
-    Pass save_as (e.g. "acme-swe-2026") to also persist the JD under
-    jd://history/{save_as} for later reuse.
-    """
-    result = _extract_jd_keywords(jd_text)
-    if save_as:
-        storage.save_jd(save_as, jd_text, result)
-    return result
+
+@mcp.tool()
+@_safe_tool
+def save_tailoring_evidence(workflow_id: str, term: str, category: str, evidence_text: str = "",
+                            confirmed: bool = False, metrics: list[str] | None = None) -> dict:
+    """STEP 2. Record what the user EXPLICITLY told you, in this workflow,
+    about one missing JD term. Only call with confirmed=True when the user
+    stated the fact themselves -- not from silence, memory, earlier chats,
+    "sounds right", "just optimize it", or your own reasoning.
+
+    category: professional | internship | personal_project | academic |
+    coursework | certification | learning_only | none ("none" = they don't
+    have it; the term will be reported as not added).
+    evidence_text: the user's own description (e.g. "Built REST APIs with
+    FastAPI for my personal RAG project"). metrics: any numbers the user
+    gave, each quoted exactly as it appears in evidence_text. Pass the
+    returned evidence IDs to tailor_resume."""
+    from lib import evidence
+    return evidence.save_evidence(workflow_id, term, category, evidence_text=evidence_text,
+                                  confirmed=confirmed, metrics=metrics)
 
 
 @mcp.tool()
@@ -472,13 +490,6 @@ def export_resume(version: str = "master", format: str = "pdf", template: str = 
 def list_versions() -> dict:
     """List all saved resume versions (excluding the master)."""
     return {"versions": storage.list_version_ids()}
-
-
-@mcp.tool()
-@_safe_tool
-def list_saved_jds() -> dict:
-    """List all job descriptions saved via extract_jd_keywords(save_as=...)."""
-    return {"jds": storage.list_jd_ids()}
 
 
 # --------------------------------------------------------------------------

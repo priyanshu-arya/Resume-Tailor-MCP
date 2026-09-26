@@ -217,7 +217,7 @@ def test_index_blocks_types_and_parents(legacy_master):
     idx = index_blocks(doc)
 
     assert idx[SUMMARY_ID] == {"type": "summary", "section": "summary", "parent_id": None,
-                               "text": doc["summary"], "category": None}
+                               "text": doc["summary"], "category": "master_summary"}
 
     assert idx["exp-001"]["type"] == "experience" and idx["exp-001"]["parent_id"] is None
     assert idx["exp-001"]["text"] == "Software Engineer Acme Corp"

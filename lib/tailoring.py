@@ -82,6 +82,43 @@ def _choose_version_id(save_as: str, workflow_id: str, ws: Workspace) -> str:
     return suffixed
 
 
+_SECTION_LABELS = {"experience": "Experience", "projects": "Projects", "education": "Education",
+                   "skills": "Skills", "summary": "Summary"}
+
+
+def evidence_usage(body: dict, summary_refs: list[dict], evidence: dict[str, dict], workflow: dict) -> dict:
+    """What confirmed evidence was actually used, where, and what was
+    intentionally left out (spec §57-58). Derived from the saved blocks'
+    source_refs, so it reports what is really on the page."""
+    used: list[dict] = []
+
+    def note(refs, section, block_id):
+        for ref in refs or []:
+            if ref.get("type") == "evidence" and ref.get("id") in evidence:
+                ev = evidence[ref["id"]]
+                used.append({"term": ev.get("term_display") or ev["term"], "category": ev["category"],
+                             "section": _SECTION_LABELS[section], "evidence_id": ev["id"], "block_id": block_id})
+
+    note(summary_refs, "summary", "sum-001")
+    for section in ("experience", "projects", "education"):
+        for entry in body.get(section) or []:
+            for b in entry.get("bullets") or []:
+                note(b.get("source_refs"), section, b.get("id"))
+    for group in body.get("skills") or []:
+        for item in group.get("items") or []:
+            if isinstance(item, dict):
+                note(item.get("source_refs"), "skills", item.get("id"))
+
+    used_terms = {u["term"].lower() for u in used} | {evidence[u["evidence_id"]]["term"] for u in used}
+    not_added = [{"term": ev.get("term_display") or ev["term"], "reason": "you said you have no experience with it"}
+                 for ev in evidence.values() if ev["category"] == "none"]
+    declined = {ev["term"] for ev in evidence.values() if ev["category"] == "none"}
+    for term in (workflow.get("analysis") or {}).get("priority_missing", []):
+        if term not in used_terms and term not in declined:
+            not_added.append({"term": term, "reason": "no supporting evidence in the master or confirmed by you"})
+    return {"added_terms": used, "not_added": not_added}
+
+
 def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str | None = None,
            evidence_ids: list[str] | None = None, template: str = "auto", source_kind: str = "resume",
            repair_of: str | None = None, ws: Workspace | None = None) -> dict:
@@ -131,6 +168,7 @@ def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str 
     body, report = validate_and_apply(master, all_patches, workflow_id=workflow_id, evidence=evidence,
                                       provenance_hook=_provenance_hook(master, evidence))
 
+    usage = evidence_usage(body, report["summary"]["source_refs"], evidence, workflow)
     template_id, template_version = _resolve_template(template, master, jd_text)
     match = match_resume_to_jd(body, jd_text) if jd_text else None
 
@@ -180,7 +218,8 @@ def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str 
         "changed_block_ids": report.get("changed_block_ids", []),
         "new_block_ids": report.get("new_block_ids", []),
         "dropped_block_ids": report.get("dropped_block_ids", []),
-        "added_terms": report.get("added_terms", []),
+        "added_terms": usage["added_terms"],
+        "not_added": usage["not_added"],
         "next_step": "Call validate_version, then release_resume, then export_resume.",
     }
     if match:

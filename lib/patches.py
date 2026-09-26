@@ -38,6 +38,7 @@ from lib.errors import ResumeTailorError
 from lib.ids import experience_category, index_blocks, project_category
 from lib.schemas import (
     CLAIM_RANK,
+    MASTER_PSEUDO_CATEGORIES,
     MASTER_SKILL_CATEGORY,
     REPAIR_SAFE_OPERATIONS,
     SUMMARY_ID,
@@ -303,8 +304,8 @@ def derive_claim_strength(ref_infos: list[dict]) -> str | None:
     """
     if not ref_infos:
         return None
-    best = max(ref_infos, key=lambda r: (claim_rank(r["category"]), r["category"] != MASTER_SKILL_CATEGORY))
-    return None if best["category"] == MASTER_SKILL_CATEGORY else best["category"]
+    best = max(ref_infos, key=lambda r: (claim_rank(r["category"]), r["category"] not in MASTER_PSEUDO_CATEGORIES))
+    return None if best["category"] in MASTER_PSEUDO_CATEGORIES else best["category"]
 
 
 # --------------------------------------------------------------------------
@@ -333,7 +334,8 @@ def _check_replace(p: ReplaceBlock, body: dict, state: dict, ctx: _Ctx):
     ref_rej, infos = _check_refs([r.model_dump() for r in p.new_content.source_refs], ctx)
     rejections += ref_rej
     return rejections, {"loc": loc, "infos": infos, "target_type": loc["type"], "target_section": loc["section"],
-                        "text": p.new_content.text}
+                        "text": p.new_content.text,
+                        "parent_category": _entry_category(loc["section"], loc.get("parent"))}
 
 
 def _check_drop(p: DropBlock, body: dict, state: dict, ctx: _Ctx):
@@ -388,7 +390,8 @@ def _check_add_block(p: AddBlock, body: dict, state: dict, ctx: _Ctx):
     rejections += ref_rej
     entry = loc["container"][loc["index"]]
     return rejections, {"entry": entry, "infos": infos, "target_type": _ENTRY_SECTIONS[loc["section"]][0],
-                        "target_section": loc["section"], "text": p.new_content.text}
+                        "target_section": loc["section"], "text": p.new_content.text,
+                        "parent_category": _entry_category(loc["section"], entry)}
 
 
 def _check_add_skill(p: AddSkillItem, body: dict, state: dict, ctx: _Ctx):
@@ -499,6 +502,21 @@ _APPLY = {
 _CONTENT_OPERATIONS = ("replace_block", "add_block", "add_skill_item")
 
 
+def _entry_category(section: str, entry: dict | None) -> str | None:
+    """Category of the entry a bullet sits under (internship vs full-time
+    role, academic vs personal project) -- lets the provenance hook stop
+    internship evidence being presented under a full-time role."""
+    if not entry:
+        return None
+    if section == "experience":
+        return experience_category(entry)
+    if section == "projects":
+        return project_category(entry)
+    if section == "education":
+        return "academic"
+    return None
+
+
 def _hook_ctx(index: int, patch, plan: dict) -> dict:
     if patch.operation == "add_skill_item":
         refs, explicit = patch.source_refs, patch.claim_strength
@@ -510,6 +528,7 @@ def _hook_ctx(index: int, patch, plan: dict) -> dict:
         "target_type": plan["target_type"],
         "target_section": plan["target_section"],
         "skill_group_category": plan.get("skill_group_category"),
+        "parent_category": plan.get("parent_category"),
         "text": plan["text"],
         "source_refs": [r.model_dump() for r in refs],
         "claim_strength": _claim(explicit, plan["infos"]),

@@ -15,7 +15,7 @@ from __future__ import annotations
 import copy
 import re
 
-from lib.schemas import MASTER_SKILL_CATEGORY, SCHEMA_VERSION, SUMMARY_ID, validate_kind
+from lib.schemas import MASTER_SKILL_CATEGORY, MASTER_SUMMARY_CATEGORY, SCHEMA_VERSION, SUMMARY_ID, validate_kind
 
 _SECTIONS = ("skills", "experience", "education", "projects", "certifications")
 _INTERN_RE = re.compile(r"\bintern(ship)?s?\b", re.IGNORECASE)
@@ -163,7 +163,10 @@ def index_blocks(doc: dict) -> dict[str, dict]:
             index[block_id] = {"type": type_, "section": section, "parent_id": parent_id,
                                "text": text or "", "category": category}
 
-    add(SUMMARY_ID, "summary", "summary", None, doc.get("summary", ""), None)
+    # The master summary may support a rewritten summary (placement: summary
+    # only). An empty summary has nothing to cite.
+    add(SUMMARY_ID, "summary", "summary", None, doc.get("summary", ""),
+        MASTER_SUMMARY_CATEGORY if doc.get("summary") else None)
 
     for e in doc.get("experience") or []:
         cat = experience_category(e)

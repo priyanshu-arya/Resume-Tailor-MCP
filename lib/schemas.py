@@ -67,10 +67,13 @@ CLAIM_RANK: dict[str, int] = {
 # Master skill items get their own pseudo-category: they may only support
 # claims in the Skills section.
 MASTER_SKILL_CATEGORY = "master_skill"
+# The master's own summary may support a rewritten summary -- and nothing else.
+MASTER_SUMMARY_CATEGORY = "master_summary"
+MASTER_PSEUDO_CATEGORIES = (MASTER_SKILL_CATEGORY, MASTER_SUMMARY_CATEGORY)
 
 
 def claim_rank(category: str) -> int:
-    if category == MASTER_SKILL_CATEGORY:
+    if category in MASTER_PSEUDO_CATEGORIES:
         return CLAIM_RANK["professional"]
     return CLAIM_RANK[category]
 
