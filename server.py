@@ -31,10 +31,8 @@ from lib.errors import ResumeTailorError, internal_error_result
 from lib.ids import normalize_master
 from lib.schemas import validate_kind
 from lib import templates as _templates
-from lib import export as _export
 from lib.matching import match_resume_to_jd as _match_resume_to_jd
 from lib.ats import score_ats as _score_ats
-from lib.export import export_resume as _export_resume
 
 mcp = FastMCP("resume-tailor")
 
@@ -399,87 +397,70 @@ def recommend_template(jd_text: str, version: str = "master") -> dict:
     return _templates.recommend_template(jd_text, _load_readable(version))
 
 
+@mcp.tool()
+@_safe_tool
+def validate_version(version_id: str, workflow_id: str) -> dict:
+    """STEP 4. Run every deterministic check on a tailored version: source
+    (master hash + patch replay), provenance, etiquette/ATS content,
+    structure, template contract, LaTeX (inferred) and the compiled PDF
+    (measured: page count/size, fonts, font size, margins, text). Returns
+    critical_failures, warnings, measured_properties, inferred_properties
+    and not_available. Nothing is released by this call."""
+    from lib import release
+    return release.validate_version(version_id, workflow_id)
+
+
+@mcp.tool()
+@_safe_tool
+def release_resume(version_id: str, workflow_id: str) -> dict:
+    """STEP 5. The release gate. Re-validates, and only if there are no
+    critical/error failures (and PDF verification is available) writes a
+    release report, freezes the version (released versions are immutable)
+    and publishes the exact validated PDF + LaTeX. A blocked release returns
+    the failures; repair with tailor_resume(repair_of=...) using only
+    drop_block/reorder patches (max 3), or pick a supported template. Never
+    tell the user the resume is done unless released is true."""
+    from lib import release
+    return release.release_resume(version_id, workflow_id)
+
+
 @mcp.tool(structured_output=False)
 @_safe_tool
-def export_resume(version: str = "master", format: str = "pdf", template: str = "auto", jd_text: str | None = None):
-    """Export a resume version to a real file.
+def export_resume(version: str, workflow_id: str | None = None, format: str = "pdf", mode: str = "release"):
+    """STEP 6. Return the PDF (embedded) and its exact LaTeX source.
 
-    ALWAYS compiles and returns the PDF + its LaTeX source directly in this
-    tool's response, no matter what `format` is -- there is nothing to go
-    dig out of a folder afterwards. The PDF is always rendered with the
-    Jake's-Resume-style `classic-minimalist` LaTeX template, since that's
-    the only layout with a real LaTeX/PDF renderer; if a different
-    `template` was requested it's noted in the response but the PDF still
-    gets produced. (Both files are also saved under data/exports/ as a
-    backup.)
-
-    Pass format="docx", "md", or "txt" to ALSO save the resume in that
-    format (section order/heading color follow `template` there) --
-    the PDF + LaTeX are still always included on top of it. format="tex"
-    just skips the docx/md/txt extra and returns the PDF + LaTeX alone,
-    same as the default format="pdf".
-
-    template: a specific template id (see list_templates), or "auto" (default).
-    Auto-selection needs a JD to score against -- pass jd_text, or it falls
-    back to the classic-minimalist default template.
-    """
-    resume = _load_readable(version)
-    export_dir = _workspace.get_exports_path()
-    version = _workspace.validate_id(version or "master", "version")
-
-    if template == "auto":
-        template_id = _templates.recommend_template(jd_text, resume)["recommended_template"] if jd_text else _templates.DEFAULT_TEMPLATE_ID
-    else:
-        template_id = template
-
-    fmt = format.lower().lstrip(".")
-
-    export_dir.mkdir(parents=True, exist_ok=True)
-    pdf_out_path = str(export_dir / f"{version}.pdf")
-
-    pdf_render_template = "classic-minimalist"
-    tex_source = _export.to_tex(resume, pdf_render_template)
-    pdf_path = Path(_export.to_pdf(resume, pdf_out_path, pdf_render_template)).resolve()
-    tex_path = pdf_path.with_suffix(".tex")
-    pdf_bytes = pdf_path.read_bytes()
-
-    summary = {"template": pdf_render_template, "pdf_path": str(pdf_path), "tex_path": str(tex_path)}
-
-    extra_note = ""
-    extra_file_line = ""
-    if fmt not in ("pdf", "tex"):
-        extra_out_path = str(export_dir / f"{version}.{fmt}")
-        extra_path = Path(_export_resume(resume, extra_out_path, fmt, template_id)).resolve()
-        summary[f"{fmt}_path"] = str(extra_path)
-        extra_file_line = f"Also saved {fmt}: {extra_path}\n"
-    if template_id != pdf_render_template:
-        extra_note = (
-            f"(Requested template '{template_id}' has no LaTeX/PDF renderer yet, so the PDF/LaTeX "
-            f"above used '{pdf_render_template}' instead"
-            + (f"; the {fmt} file above still uses '{template_id}'.)\n" if fmt not in ("pdf", "tex") else ".)\n")
-        )
-
+    mode="release" (default): only for a version that passed release_resume;
+    returns the byte-identical released files. mode="draft": an on-demand,
+    clearly labelled DRAFT / UNVERIFIED preview (also how a master is
+    previewed: version="master-resume" or "master-cv"). format docx/md/txt
+    also writes that file. The PDF is always rendered with the version's own
+    template -- a template without a production renderer is an error, never
+    silently swapped for another one."""
+    from lib import release
+    out = release.export(version, workflow_id, format, mode)
+    summary = {k: out[k] for k in ("label", "released", "template_id", "pdf_path", "tex_path", "tex_sha256",
+                                   "pdf_sha256") if k in out}
+    if "extra_path" in out:
+        summary[f"{format}_path"] = out["extra_path"]
     return [
         types.TextContent(
             type="text",
             text=(
-                f"Saved PDF to: {pdf_path}\n"
-                f"Saved LaTeX to: {tex_path}\n"
-                f"{extra_file_line}"
-                "(If the PDF doesn't appear as an attachment above in this chat, "
-                "open it directly from that path -- some MCP clients don't render "
-                "embedded file blobs inline.)\n"
-                f"{extra_note}\n"
+                f"{out['label']}\n"
+                f"PDF: {out['pdf_path']}\nLaTeX: {out['tex_path']}\n"
+                + (f"Also saved {format}: {out['extra_path']}\n" if "extra_path" in out else "")
+                + "(If the PDF doesn't appear as an attachment, open it from that path -- some MCP clients "
+                "don't render embedded file blobs inline.)\n\n"
                 f"```json\n{json.dumps(summary, indent=2)}\n```\n\n"
-                f"LaTeX source:\n\n```latex\n{tex_source}\n```"
+                f"LaTeX source (this exact text was compiled into the PDF):\n\n```latex\n{out['tex']}\n```"
             ),
         ),
         types.EmbeddedResource(
             type="resource",
             resource=types.BlobResourceContents(
-                uri=f"file://{pdf_path}",
+                uri=f"file://{out['pdf_path']}",
                 mimeType="application/pdf",
-                blob=base64.b64encode(pdf_bytes).decode("ascii"),
+                blob=base64.b64encode(out["pdf_bytes"]).decode("ascii"),
             ),
         ),
     ]
@@ -497,23 +478,22 @@ def list_versions() -> dict:
 # --------------------------------------------------------------------------
 
 @mcp.prompt()
-def tailor_resume_workflow(jd_text: str, company: str = "", role: str = "") -> str:
-    """Guided workflow: analyze a JD against the master resume, then draft
-    and save a tailored version."""
-    suggested_id = "-".join(x for x in [company.lower().replace(" ", "-"), role.lower().replace(" ", "-"), str(date.today())] if x) or f"tailored-{date.today()}"
-    return f"""I want you to tailor my resume to this job description. Please:
+def tailor_resume_workflow(jd_text: str, company: str = "", role: str = "", kind: str = "resume") -> str:
+    """Guided, gated tailoring workflow: evidence -> patches -> validate ->
+    release -> export."""
+    suggested_id = "-".join(x for x in [company, role, str(date.today())] if x) or f"tailored-{date.today()}"
+    return f"""Tailor my {kind} to this job description. The server enforces the rules; follow this order exactly:
 
-1. Read the resume://etiquette resource first -- it has the bullet formula, summary formula by career stage, ATS/keyword rules, and the golden rule (reorganize and tailor real evidence, never invent metrics, technologies, titles, dates, publications, or skills).
-2. Call match_resume_to_jd with this JD text against my master resume to see the keyword gap analysis (matched / missing / weak, plus the score).
-3. Call get_master_resume to see my current resume content.
-4. Rewrite the summary and relevant experience/project bullets to naturally incorporate the MISSING and WEAK keywords where they're truthfully applicable -- do not fabricate experience I don't have. Follow the bullet formula (action verb + context/method + measurable result where honestly available) and avoid the weak openers and generic summary phrases listed in resume://etiquette.
-5. Call tailor_resume with save_as="{suggested_id}" (or a better id you choose), the full updated resume dict, and this jd_text so I get an updated match score back.
-6. Call score_ats on the new version to check formatting and etiquette issues (weak openers, generic summary phrases, unnecessary personal identifiers, quantification, bullet density).
-7. Show me a summary: before/after match score, what changed, and any remaining ATS/etiquette issues.
-8. MANDATORY, not optional: call export_resume with format="pdf" (the default) and this jd_text. It returns the compiled PDF and its LaTeX source directly in the tool result. Deliver BOTH in your reply -- the PDF as the actual attached/embedded file, and the LaTeX source as a ```latex code block -- every time I ask you to tailor a resume/CV to a JD. Saving a version with tailor_resume is not the deliverable; the PDF + LaTeX are. Never stop at a file path or a prose description of the changes.
+1. Read resume://etiquette (content rules, evidence placement matrix, verb scope) before writing anything.
+2. analyze_tailoring_requirements(jd_text, source_kind="{kind}") -> keep the workflow_id. Source of truth is ONLY the workspace master -- never Claude memory, earlier conversations, or previous tailored versions.
+3. For each evidence prompt, ask me in plain words whether and how I have used the term (professional, internship, personal project, academic, coursework, certification, learning only, or not at all). Do not answer for me or assume. Only after I explicitly answer, call save_tailoring_evidence(confirmed=True) with my own words (and any numbers I gave, quoted exactly). If I say I don't have it, save category "none".
+4. get_master_resume(kind="{kind}") -> use citable_blocks IDs.
+5. Propose structured patches (never a full resume) and call tailor_resume(save_as="{suggested_id}", patches=..., workflow_id=..., evidence_ids=[...]). Every new/changed block cites real source_refs. Reword for relevance and JD terminology only where the evidence supports it; never raise claim strength, add metrics, technologies or scope that the sources do not state. If the server rejects a patch, fix the patch -- do not work around the rule.
+6. validate_version, then release_resume. If release is blocked, repair only with drop_block/reorder patches via tailor_resume(repair_of=...) (max 3), or report that release is blocked. Never shrink fonts/margins or pick an unregistered layout.
+7. export_resume(version, workflow_id) and deliver BOTH the attached PDF and the LaTeX source in a ```latex block.
+8. Finish with: Source (workspace master {kind}); Template; Added after my confirmation (term - category - section - why useful); Not added (and why); what was optimized; validation results; Released: yes/no. Say plainly where each confirmed term was placed (e.g. "AWS was added to Projects because you confirmed your personal project ran on AWS EC2; it was not added to Experience").
 
-Here is the job description:
-
+Job description:
 ---
 {jd_text}
 ---

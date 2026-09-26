@@ -7,8 +7,10 @@ from pathlib import Path
 
 from lib import templates as _templates
 from lib import latex as _latex
+from lib.errors import ResumeTailorError
 from lib.ids import cert_text, skill_names
 from lib.links import linkedin_label, normalize_url
+from lib.locking import sha256_bytes
 
 TECTONIC_BIN = Path(__file__).resolve().parent.parent / "bin" / "tectonic"
 
@@ -347,35 +349,104 @@ def _tectonic_path() -> str:
     found = shutil.which("tectonic")
     if found:
         return found
-    raise RuntimeError(
+    raise ResumeTailorError(
+        "LATEX_COMPILE_FAILED",
         "No tectonic binary found (expected at bin/tectonic, or 'tectonic' on "
         "PATH). Download the standalone release for your platform from "
         "https://github.com/tectonic-typesetting/tectonic/releases and place "
-        "it at bin/tectonic."
+        "it at bin/tectonic.",
     )
+
+
+_LOG_MAX_CHARS = 20_000
+_LOG_TAIL_CHARS = 2_000
+_BASENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_OVERFULL_RE = re.compile(r"Overfull \\hbox")
+_UNDERFULL_RE = re.compile(r"Underfull \\hbox")
+
+
+def _validate_basename(basename: str) -> str:
+    if not isinstance(basename, str) or "/" in basename or "\\" in basename or ".." in basename:
+        raise ResumeTailorError("PATH_TRAVERSAL", "basename must be a plain filename stem (no path separators or '..').")
+    if not _BASENAME_RE.match(basename):
+        raise ResumeTailorError("INVALID_ID", "basename may only contain letters, digits, '.', '_' and '-'.")
+    return basename
+
+
+def _last_tex_pass(log: str) -> str:
+    """Tectonic reruns TeX until the aux files settle and repeats every box
+    warning on each pass -- count only the final pass."""
+    cut = max(log.rfind("note: Rerunning TeX"), log.rfind("note: Running TeX"))
+    return log[cut:] if cut >= 0 else log
+
+
+def compile_tex(tex: str, out_dir: Path, basename: str, timeout: int = 120) -> dict:
+    """Compile exactly `tex` (spec §44). The string is written byte-for-byte
+    to `out_dir/<basename>.tex`, compiled with tectonic, and the written file
+    is re-hashed afterwards so the returned `tex_sha256` provably identifies
+    the source the PDF was built from."""
+    _validate_basename(basename)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    tex_path = out_dir / f"{basename}.tex"
+    pdf_path = out_dir / f"{basename}.pdf"
+
+    tex_bytes = tex.encode("utf-8")
+    expected_sha = sha256_bytes(tex_bytes)
+    tex_path.write_bytes(tex_bytes)
+    if pdf_path.exists():
+        pdf_path.unlink()  # never report a stale PDF from an earlier run
+
+    tectonic = _tectonic_path()
+    try:
+        result = subprocess.run(
+            [tectonic, "--outdir", str(out_dir), str(tex_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # one interleaved stream, so pass boundaries stay in order
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise ResumeTailorError(
+            "LATEX_COMPILE_FAILED",
+            f"tectonic timed out after {timeout}s.",
+            details={"log_tail": ""},
+        ) from e
+
+    full_log = result.stdout or ""
+    if result.returncode != 0 or not pdf_path.exists():
+        raise ResumeTailorError(
+            "LATEX_COMPILE_FAILED",
+            f"tectonic compilation failed (exit code {result.returncode}).",
+            details={"log_tail": full_log[-_LOG_TAIL_CHARS:]},
+        )
+
+    actual_sha = sha256_bytes(tex_path.read_bytes())
+    if actual_sha != expected_sha:
+        raise ResumeTailorError(
+            "LATEX_COMPILE_FAILED",
+            "The .tex file on disk no longer matches the compiled source.",
+        )
+
+    last_pass = _last_tex_pass(full_log)
+    return {
+        "pdf_path": str(pdf_path),
+        "tex_path": str(tex_path),
+        "log": full_log[-_LOG_MAX_CHARS:],
+        "tex_sha256": expected_sha,
+        "pdf_sha256": sha256_bytes(pdf_path.read_bytes()),
+        "overfull_hbox_count": len(_OVERFULL_RE.findall(last_pass)),
+        "underfull_hbox_count": len(_UNDERFULL_RE.findall(last_pass)),
+    }
 
 
 def to_pdf(resume: dict, out_path: str, template_id: str | None = None) -> str:
-    """Render the resume to LaTeX and compile it to PDF with tectonic (a
-    self-contained LaTeX engine bundled at bin/tectonic -- no LibreOffice or
-    system LaTeX distribution required)."""
+    """Render the resume to LaTeX once and compile that exact string with
+    tectonic (a self-contained LaTeX engine bundled at bin/tectonic). The
+    .tex is left next to the PDF (same stem)."""
     out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    tex_path = out_path.with_suffix(".tex")
-    tex_path.write_text(to_tex(resume, template_id), encoding="utf-8")
-
-    tectonic = _tectonic_path()
-    result = subprocess.run(
-        [tectonic, "--outdir", str(out_path.parent), str(tex_path)],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"tectonic compilation failed:\n{result.stdout}\n{result.stderr}")
-
-    produced = tex_path.with_suffix(".pdf")
+    info = compile_tex(to_tex(resume, template_id), out_path.parent, out_path.stem)
+    produced = Path(info["pdf_path"])
     if produced != out_path:
         produced.replace(out_path)
     return str(out_path)
