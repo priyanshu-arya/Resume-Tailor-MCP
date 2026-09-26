@@ -1,0 +1,189 @@
+"""Master-only tailoring (spec §13-14, §37, §60).
+
+The server loads the workspace master itself; Claude only supplies
+structured patches (validated by lib/patches.py) and the IDs of evidence
+the user confirmed in this workflow. There is deliberately no way to pass a
+resume body in, and no way to use a previous tailored version as a source:
+a version is a historical output, never an input.
+
+Repairs follow the same rule. A repair does not edit the failing version --
+it re-applies that version's original (already validated) patches plus
+new drop/reorder-only patches to the *same* master, producing a new
+version. Source refs therefore never drift, and a repair can only remove or
+reorder content, never add claims.
+"""
+
+from __future__ import annotations
+
+from lib import storage, workflows
+from lib.errors import ResumeTailorError
+from lib.locking import atomic_write_yaml, workspace_lock
+from lib.matching import match_resume_to_jd
+from lib.patches import parse_patches, validate_and_apply
+from lib.schemas import REPAIR_SAFE_OPERATIONS, validate_kind
+from lib.workspace import Workspace, get_workspace, safe_child, slugify, utc_now_iso
+from lib.locking import sha256_text
+
+
+def _patches_path(ws: Workspace, version_id: str):
+    return safe_child(ws.sessions_dir, f"patches-{version_id}", ".yaml")
+
+
+def load_version_patches(version_id: str, ws: Workspace) -> dict:
+    data = storage.yaml_load_file(_patches_path(ws, version_id))
+    if data is None:
+        raise ResumeTailorError("VERSION_NOT_FOUND", f"No recorded patches for version {version_id!r}.")
+    return data
+
+
+def _load_evidence(ws: Workspace, workflow_id: str, evidence_ids: list[str]) -> dict[str, dict]:
+    if not evidence_ids:
+        return {}
+    try:
+        from lib import evidence as _evidence
+    except ImportError:
+        raise ResumeTailorError("EVIDENCE_NOT_FOUND", "Evidence support is not available yet.") from None
+    return _evidence.load_evidence(workflow_id, evidence_ids, ws=ws)
+
+
+def _provenance_hook(master: dict, evidence: dict[str, dict]):
+    try:
+        from lib.validators import provenance as _prov
+    except ImportError:
+        return None
+    return _prov.make_hook(master, evidence)
+
+
+def _resolve_template(template: str, master: dict, jd_text: str | None) -> tuple[str, str | None]:
+    try:
+        from lib import templates as _templates
+        resolve = _templates.resolve_for_tailoring
+    except (ImportError, AttributeError):
+        return ("classic-minimalist" if template in (None, "", "auto") else template), None
+    return resolve(template, master, jd_text)
+
+
+def _rules_version() -> str | None:
+    try:
+        from lib import rules as _rules
+    except ImportError:
+        return None
+    return _rules.rules_version()
+
+
+def _choose_version_id(save_as: str, workflow_id: str, ws: Workspace) -> str:
+    base = slugify(save_as)
+    if not storage.version_exists(base, ws):
+        return base
+    suffixed = f"{base}-{sha256_text(workflow_id + save_as)[:4]}"
+    if storage.version_exists(suffixed, ws):
+        raise ResumeTailorError("VERSION_EXISTS", f"Version {base!r} (and {suffixed!r}) already exist; "
+                                "choose a different save_as.")
+    return suffixed
+
+
+def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str | None = None,
+           evidence_ids: list[str] | None = None, template: str = "auto", source_kind: str = "resume",
+           repair_of: str | None = None, ws: Workspace | None = None) -> dict:
+    ws = ws or get_workspace()
+    validate_kind(source_kind)
+    workflow = workflows.load_workflow(workflows.check_workflow_id(workflow_id), ws)
+    if workflow["source_kind"] != source_kind:
+        raise ResumeTailorError("INVALID_KIND", f"Workflow {workflow_id} was started for the master "
+                                f"{workflow['source_kind']}, not {source_kind}.")
+
+    master, master_hash = storage.require_master(source_kind, ws)
+    from lib.master_ops import master_readiness
+    readiness = master_readiness(master)
+    if not readiness["ready"]:
+        raise ResumeTailorError("MASTER_INVALID", "The master still has unparsed content. Place it, or "
+                                "have the user explicitly accept it, before tailoring.", details=readiness)
+
+    if jd_text is None and workflow.get("jd_id"):
+        jd_text = (storage.load_jd(workflow["jd_id"], ws) or {}).get("jd_text")
+
+    new_patches = [p.model_dump(mode="json", exclude_none=True) for p in parse_patches(patches)]
+    evidence_ids = list(dict.fromkeys(evidence_ids or []))
+
+    if repair_of:
+        if workflow.get("repair_attempts", 0) >= workflows.MAX_REPAIR_ATTEMPTS:
+            raise ResumeTailorError("REPAIR_LIMIT", f"Repair limit ({workflows.MAX_REPAIR_ATTEMPTS}) reached "
+                                    "for this workflow; release is blocked.")
+        bad = [i for i, p in enumerate(new_patches) if p["operation"] not in REPAIR_SAFE_OPERATIONS]
+        if bad:
+            raise ResumeTailorError("PATCH_INVALID", "Repairs may only drop or reorder blocks.",
+                                    details={"rejections": [{"patch_index": i, "rule": "repair.forbidden_operation"}
+                                                            for i in bad]})
+        prior = storage.require_version(repair_of, ws)
+        prior_meta = prior.get("metadata") or {}
+        if prior_meta.get("workflow_id") != workflow_id:
+            raise ResumeTailorError("PATCH_INVALID", "Can only repair a version from the same workflow.")
+        if prior_meta.get("source_master_hash") != master_hash:
+            raise ResumeTailorError("MASTER_CONFLICT", "The master changed since the version being repaired "
+                                    "was created; start a new tailoring run.")
+        recorded = load_version_patches(repair_of, ws)
+        all_patches = recorded["patches"] + new_patches
+        evidence_ids = list(dict.fromkeys(recorded.get("evidence_ids", []) + evidence_ids))
+    else:
+        all_patches = new_patches
+
+    evidence = _load_evidence(ws, workflow_id, evidence_ids)
+    body, report = validate_and_apply(master, all_patches, workflow_id=workflow_id, evidence=evidence,
+                                      provenance_hook=_provenance_hook(master, evidence))
+
+    template_id, template_version = _resolve_template(template, master, jd_text)
+    match = match_resume_to_jd(body, jd_text) if jd_text else None
+
+    with workspace_lock(ws):
+        _, current_hash = storage.load_master(source_kind, ws)
+        if current_hash != master_hash:
+            raise ResumeTailorError("MASTER_CONFLICT", "The master changed while tailoring; nothing was saved.",
+                                    details={"expected_hash": master_hash, "current_hash": current_hash})
+        version_id = _choose_version_id(save_as, workflow_id, ws)
+        doc = dict(body)
+        doc["metadata"] = {
+            "version_id": version_id,
+            "workspace_id": ws.id,
+            "workflow_id": workflow_id,
+            "source_master_hash": master_hash,
+            "document_kind": source_kind,
+            "template_id": template_id,
+            "template_version": template_version,
+            "rules_version": _rules_version(),
+            "jd_id": workflow.get("jd_id"),
+            "evidence_ids": evidence_ids,
+            "created_at": utc_now_iso(),
+            "released": False,
+            "release_report_id": None,
+            "repair_of": repair_of,
+            "unknown_jd_requirements": list((workflow.get("analysis") or {}).get("unknown_requirements", [])),
+            "summary_source_refs": report["summary"]["source_refs"],
+            "summary_claim_strength": report["summary"].get("claim_strength"),
+        }
+        storage.save_version(version_id, doc, ws)
+        atomic_write_yaml(_patches_path(ws, version_id), {"version_id": version_id, "workflow_id": workflow_id,
+                                                          "evidence_ids": evidence_ids, "patches": all_patches})
+        workflows.update_workflow(
+            workflow_id, ws=ws, append={"version_ids": [version_id], "evidence_ids": evidence_ids},
+            set_fields={"status": "tailored",
+                        "repair_attempts": workflow.get("repair_attempts", 0) + (1 if repair_of else 0)},
+        )
+
+    result = {
+        "ok": True,
+        "version_id": version_id,
+        "workflow_id": workflow_id,
+        "source": f"workspace master {source_kind}",
+        "source_master_hash": master_hash,
+        "template_id": template_id,
+        "released": False,
+        "changed_block_ids": report.get("changed_block_ids", []),
+        "new_block_ids": report.get("new_block_ids", []),
+        "dropped_block_ids": report.get("dropped_block_ids", []),
+        "added_terms": report.get("added_terms", []),
+        "next_step": "Call validate_version, then release_resume, then export_resume.",
+    }
+    if match:
+        result["match_score"] = match["score"]
+        result["still_missing"] = match["missing"]
+    return result

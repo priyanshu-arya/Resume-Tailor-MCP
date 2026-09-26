@@ -223,29 +223,35 @@ class TailoringEvidence(BaseModel):
 # Structured patches from Claude (spec §13) -- UNTRUSTED input
 # --------------------------------------------------------------------------
 
-class PatchTarget(BaseModel):
+class _Strict(BaseModel):
+    # Patches are untrusted: unknown fields (e.g. an attempt to set `title`
+    # or `dates`) are rejected, never silently ignored.
+    model_config = ConfigDict(extra="forbid")
+
+
+class PatchTarget(_Strict):
     id: str
 
 
-class NewContent(BaseModel):
+class NewContent(_Strict):
     text: str
     source_refs: list[SourceRef] = Field(default_factory=list)
     claim_strength: ClaimStrength | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ReplaceBlock(BaseModel):
+class ReplaceBlock(_Strict):
     operation: Literal["replace_block"]
     target: PatchTarget
     new_content: NewContent
 
 
-class DropBlock(BaseModel):
+class DropBlock(_Strict):
     operation: Literal["drop_block"]
     target: PatchTarget
 
 
-class Reorder(BaseModel):
+class Reorder(_Strict):
     operation: Literal["reorder"]
     # exactly one of parent_id (bullets inside an entry) / section (entries
     # or skill groups inside a top-level section)
@@ -254,13 +260,13 @@ class Reorder(BaseModel):
     order: list[str]
 
 
-class AddBlock(BaseModel):
+class AddBlock(_Strict):
     operation: Literal["add_block"]
     parent_id: str
     new_content: NewContent
 
 
-class AddSkillItem(BaseModel):
+class AddSkillItem(_Strict):
     operation: Literal["add_skill_item"]
     category: str
     name: str

@@ -24,7 +24,7 @@ import yaml
 from mcp import types
 from mcp.server.fastmcp import FastMCP
 
-from lib import storage, parsing
+from lib import storage
 from lib import workspace as _workspace
 from lib import migration as _migration
 from lib.errors import ResumeTailorError, internal_error_result
@@ -87,7 +87,7 @@ def _dump_master(kind: str) -> str:
     if resume is None:
         return (
             f"# No master {kind} yet.\n"
-            f"# Use the parse_resume tool (kind='{kind}'), the create-master-file skill, "
+            f"# Use set_master_resume (kind='{kind}'), the create-master-file skill, "
             f"or migrate_legacy_data."
         )
     return yaml.safe_dump(resume, sort_keys=False, allow_unicode=True)
@@ -230,33 +230,32 @@ def list_workspace_size() -> dict:
 
 @mcp.tool()
 @_safe_tool
-def parse_resume(file_path: str, kind: str = "resume", replace_hash: str | None = None) -> dict:
-    """Parse a resume/CV file (.md, .txt, .docx, or .pdf) into the structured
-    format and save it as the master document.
+def set_master_resume(kind: str, file_path: str | None = None, resume: dict | None = None,
+                      mode: str = "replace", expected_hash: str | None = None, confirm: bool = False,
+                      proposed_hash: str | None = None, career_stage: str | None = None,
+                      accept_unparsed: bool = False) -> dict:
+    """Create, import, replace or update a MASTER Resume/CV (kind "resume" or
+    "cv" -- two separate documents). Only use this when the user explicitly
+    asks to create/import/change their master. Tailoring evidence is never
+    promoted to the master automatically.
 
-    kind: "resume" (default) or "cv" -- two separate canonical documents in
-    the workspace, never mixed.
-
-    If a master of that kind already exists this fails with MASTER_EXISTS.
-    Confirm with the user, then call again with replace_hash set to the
-    current master's hash (from get_master_resume) to replace it; the old
-    one is backed up.
+    - First master of a kind: written immediately (from file_path, a
+      .md/.txt/.docx/.pdf import, or from a structured `resume`).
+    - Existing master: the first call writes NOTHING and returns a diff plus
+      current_hash/proposed_hash. Show the diff to the user; only if they
+      approve, call again with confirm=True, expected_hash=current_hash and
+      proposed_hash. The previous master is backed up.
+    - mode="update" takes the full edited master (from get_master_resume)
+      as `resume`; existing block IDs are kept.
+    - career_stage: fresher | 1-3 | 3-5 | 5-10 | manager | director | academic
+      (drives the page-length cap).
+    - A master with `unparsed` leftovers is not ready for tailoring until the
+      content is placed or the user explicitly accepts it (accept_unparsed).
     """
-    validate_kind(kind)
-    resume = normalize_master(parsing.parse_resume_file(file_path), kind)
-    storage.save_master(kind, resume, replace_hash, "parse_resume import")
-    return {
-        "ok": True,
-        "kind": kind,
-        "saved_to": str(_workspace.get_master_path(kind)),
-        "name": resume.get("name"),
-        "sections_found": [
-            k for k in ("summary", "skills", "experience", "education", "projects", "certifications")
-            if resume.get(k)
-        ],
-        "unparsed_items": len(resume.get("unparsed", [])),
-        "note": "Check the 'unparsed' field in the YAML if unparsed_items > 0 -- move that content into the right fields by hand." if resume.get("unparsed") else None,
-    }
+    from lib import master_ops
+    return master_ops.set_master(kind, file_path=file_path, resume=resume, mode=mode,
+                                 expected_hash=expected_hash, confirm=confirm, proposed_hash=proposed_hash,
+                                 career_stage=career_stage, accept_unparsed=accept_unparsed)
 
 
 @mcp.tool()
@@ -292,46 +291,51 @@ def get_master_resume(kind: str = "resume") -> dict:
 
     kind: "resume" or "cv" -- these are two separate canonical documents."""
     resume, master_hash = storage.require_master(validate_kind(kind))
-    return {"ok": True, "kind": kind, "master_hash": master_hash, "master": resume}
+    from lib.ids import index_blocks
+    citable = {bid: {"type": info["type"], "section": info["section"], "category": info["category"]}
+               for bid, info in index_blocks(resume).items() if info["category"]}
+    return {
+        "ok": True,
+        "kind": kind,
+        "master_hash": master_hash,
+        "master": resume,
+        "citable_blocks": citable,
+        "note": "Cite these block IDs as source_refs ({type: master, id}) in tailor_resume patches. "
+                "Only IDs listed here are citable.",
+    }
 
 
 @mcp.tool()
 @_safe_tool
-def tailor_resume(save_as: str, resume: dict, jd_text: str | None = None, source_version: str = "master") -> dict:
-    """Save a tailored resume as a new version.
+def tailor_resume(save_as: str, patches: list[dict], workflow_id: str, jd_text: str | None = None,
+                  evidence_ids: list[str] | None = None, template: str = "auto",
+                  source_kind: str = "resume", repair_of: str | None = None) -> dict:
+    """Create a new tailored version from the WORKSPACE MASTER (loaded by the
+    server -- you cannot pass a resume, and previous versions are never a
+    source). You propose structured patches; the server validates every one
+    and rejects the whole call if any fails (nothing partial is saved).
 
-    `resume` is the FULL structured resume dict (same shape as
-    resume://master: name, contact, summary, skills, experience, education,
-    projects, certifications) after you've rewritten the relevant bullets /
-    summary / skills to match the job description. This tool just validates
-    and persists it -- the actual tailoring judgment (which bullets to
-    reword, which keywords to weave in naturally) should happen in the
-    conversation, informed by match_resume_to_jd's gap analysis and the
-    rules in the resume://etiquette resource (bullet formula, honest
-    quantification, no fabricated metrics/titles/skills, summary formula
-    by career stage). score_ats checks several of these automatically.
+    Patch operations (target IDs come from get_master_resume.citable_blocks):
+      {"operation": "replace_block", "target": {"id": "exp-001-b02"},
+       "new_content": {"text": "...", "source_refs": [{"type": "master", "id": "exp-001-b02"}],
+                       "claim_strength": "professional"}}          # summary (sum-001) or a bullet
+      {"operation": "drop_block", "target": {"id": "proj-003"}}
+      {"operation": "reorder", "section": "projects", "order": ["proj-002", "proj-001"]}
+      {"operation": "reorder", "parent_id": "exp-001", "order": [...bullet ids...]}
+      {"operation": "add_block", "parent_id": "proj-001", "new_content": {...}}   # new bullet
+      {"operation": "add_skill_item", "category": "Frameworks", "name": "FastAPI",
+       "source_refs": [{"type": "evidence", "id": "ev-..."}], "claim_strength": "personal_project"}
 
-    save_as should be a short filesystem-safe id, e.g. "acme-swe-2026-09".
+    Every new/changed block needs source_refs to real master blocks or to
+    evidence the user confirmed in THIS workflow (pass those IDs in
+    evidence_ids). Titles, companies, dates, degrees and contact details
+    cannot be patched. repair_of=<version_id> re-applies that version's
+    patches plus drop_block/reorder-only repairs (max 3 per workflow).
     """
-    required_keys = {"name", "contact", "summary", "skills", "experience", "education", "projects", "certifications"}
-    missing_keys = required_keys - set(resume.keys())
-    if missing_keys:
-        raise ValueError(f"resume is missing required keys: {sorted(missing_keys)}")
-
-    # Phase-1 bridge: replaced by the patch-based interface in phase 2.
-    ws = _workspace.get_workspace()
-    version_id = _workspace.slugify(save_as)
-    resume = dict(resume)
-    resume["metadata"] = {"version_id": version_id, "workspace_id": ws.id, "document_kind": "resume",
-                          "created_at": _workspace.utc_now_iso()}
-    storage.save_version(version_id, resume)
-
-    result = {"ok": True, "version_id": version_id, "saved_to": str(storage.version_path(version_id))}
-    if jd_text:
-        match = _match_resume_to_jd(resume, jd_text)
-        result["match_score"] = match["score"]
-        result["still_missing"] = match["missing"]
-    return result
+    from lib import tailoring
+    return tailoring.tailor(save_as, patches, workflow_id=workflow_id, jd_text=jd_text,
+                            evidence_ids=evidence_ids, template=template, source_kind=source_kind,
+                            repair_of=repair_of)
 
 
 @mcp.tool()
