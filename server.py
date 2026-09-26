@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import base64
 import difflib
+import functools
 import json
+import sys
 from datetime import date
 from pathlib import Path
 
@@ -23,6 +25,11 @@ from mcp import types
 from mcp.server.fastmcp import FastMCP
 
 from lib import storage, parsing
+from lib import workspace as _workspace
+from lib import migration as _migration
+from lib.errors import ResumeTailorError, internal_error_result
+from lib.ids import normalize_master
+from lib.schemas import validate_kind
 from lib import templates as _templates
 from lib import export as _export
 from lib.keywords import extract_jd_keywords as _extract_jd_keywords
@@ -32,7 +39,6 @@ from lib.export import export_resume as _export_resume
 
 mcp = FastMCP("resume-tailor")
 
-EXPORT_DIR = Path(__file__).resolve().parent / "data" / "exports"
 ETIQUETTE_PATH = Path(__file__).resolve().parent / "resources" / "resume_etiquette.yaml"
 
 
@@ -40,45 +46,94 @@ ETIQUETTE_PATH = Path(__file__).resolve().parent / "resources" / "resume_etiquet
 # Resources -- read-only, URI-addressable state
 # --------------------------------------------------------------------------
 
+def _safe_tool(fn):
+    """Uniform error model (spec §69): business failures become
+    {"ok": false, "error": {...}}; anything unexpected becomes a generic
+    INTERNAL_ERROR with no paths or personal data in the response."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ResumeTailorError as e:
+            return e.to_result()
+        except Exception as e:  # noqa: BLE001 - last-resort boundary
+            print(f"resume-tailor: internal error in {fn.__name__}: {type(e).__name__}", file=sys.stderr)
+            return internal_error_result()
+    return wrapper
+
+
+def _safe_resource(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ResumeTailorError as e:
+            return f"# {e.code}: {e.message}"
+    return wrapper
+
+
+def _load_readable(version: str) -> dict:
+    """Resolve a version name for READ-ONLY analysis (match/score/diff):
+    master aliases read the workspace master of that kind, anything else a
+    saved version. Tailoring never uses this -- it loads the master itself."""
+    kind = storage.resolve_master_alias(version)
+    if kind:
+        return storage.require_master(kind)[0]
+    return storage.require_version(version)
+
+
 def _dump_master(kind: str) -> str:
-    resume = storage.load_master(kind)
+    resume, _ = storage.load_master(kind)
     if resume is None:
         return (
             f"# No master {kind} yet.\n"
             f"# Use the parse_resume tool (kind='{kind}'), the create-master-file skill, "
-            f"or edit {storage.MASTER_PATHS[kind]} directly."
+            f"or migrate_legacy_data."
         )
     return yaml.safe_dump(resume, sort_keys=False, allow_unicode=True)
 
 
 @mcp.resource("resume://master")
+@_safe_resource
 def resource_master_resume() -> str:
     """The current master (canonical) resume as YAML."""
     return _dump_master("resume")
 
 
 @mcp.resource("resume://master/{kind}")
+@_safe_resource
 def resource_master_by_kind(kind: str) -> str:
     """The current master document as YAML. kind: 'resume' or 'cv' -- these
     are two separate canonical documents, never mixed."""
-    if kind not in ("resume", "cv"):
-        return f"# Unknown master kind '{kind}'. Use 'resume' or 'cv'."
-    return _dump_master(kind)
+    return _dump_master(validate_kind(kind))
 
 
 @mcp.resource("resume://sections/{name}")
+@_safe_resource
 def resource_resume_section(name: str) -> str:
     """One section of the master resume (summary, skills, experience,
     education, projects, certifications, contact)."""
-    resume = storage.load_master()
+    return _section("resume", name)
+
+
+@mcp.resource("resume://sections/{kind}/{name}")
+@_safe_resource
+def resource_section_by_kind(kind: str, name: str) -> str:
+    """One section of the master document of `kind` ('resume' or 'cv')."""
+    return _section(validate_kind(kind), name)
+
+
+def _section(kind: str, name: str) -> str:
+    resume, _ = storage.load_master(kind)
     if resume is None:
-        return f"# No master resume yet -- nothing to show for section '{name}'."
+        return f"# No master {kind} yet -- nothing to show for section '{name}'."
     if name not in resume:
         return f"# Unknown section '{name}'. Known sections: {', '.join(resume.keys())}"
     return yaml.safe_dump({name: resume[name]}, sort_keys=False, allow_unicode=True)
 
 
 @mcp.resource("resume://versions/{version_id}")
+@_safe_resource
 def resource_resume_version(version_id: str) -> str:
     """A previously saved tailored resume version, as YAML."""
     data = storage.load_version(version_id)
@@ -88,6 +143,7 @@ def resource_resume_version(version_id: str) -> str:
 
 
 @mcp.resource("jd://history/{jd_id}")
+@_safe_resource
 def resource_jd_history(jd_id: str) -> str:
     """A previously saved job description and its extracted keywords."""
     data = storage.load_jd(jd_id)
@@ -128,25 +184,71 @@ def resource_etiquette() -> str:
 # --------------------------------------------------------------------------
 
 @mcp.tool()
-def parse_resume(file_path: str, kind: str = "resume") -> dict:
+@_safe_tool
+def initialize_workspace() -> dict:
+    """Create the local Resume Tailor workspace on first run (under
+    $RESUME_TAILOR_HOME, default ~/.resume-tailor). Idempotent: returns the
+    existing workspace if one is configured. Writes no personal data -- it
+    reports where the master Resume/CV belong. If you have masters from the
+    old repo layout (resources/master_*.yaml), run migrate_legacy_data next."""
+    return {"ok": True, **_workspace.initialize_workspace()}
+
+
+@mcp.tool()
+@_safe_tool
+def get_workspace() -> dict:
+    """Show the active workspace: ID, root, master paths and which masters
+    exist. Errors with WORKSPACE_NOT_INITIALIZED if there is none yet --
+    never picks or creates one silently."""
+    return {"ok": True, **_workspace.describe_workspace()}
+
+
+@mcp.tool()
+@_safe_tool
+def migrate_legacy_data(include_versions: bool = False, include_jds: bool = False,
+                        conflict_choice: str | None = None) -> dict:
+    """Copy masters from the old repo layout (resources/master_resume.yaml,
+    resources/master_cv.yaml) into the workspace, hash-verified. Legacy
+    files are never deleted. Idempotent.
+
+    If the workspace already has a different master of that kind, nothing is
+    written and a conflict is reported -- ask the user, then call again with
+    conflict_choice="keep_workspace" or "replace_with_legacy" (the replaced
+    master is backed up). include_versions / include_jds copy old tailored
+    versions (marked legacy: true, never usable as a tailoring source) and
+    saved JDs; only do this if the user asks."""
+    return _migration.migrate_legacy(include_versions=include_versions, include_jds=include_jds,
+                                     conflict_choice=conflict_choice)
+
+
+@mcp.tool()
+@_safe_tool
+def list_workspace_size() -> dict:
+    """Report storage used by the workspace, per area. Deletes nothing."""
+    return {"ok": True, **_workspace.list_workspace_size()}
+
+
+@mcp.tool()
+@_safe_tool
+def parse_resume(file_path: str, kind: str = "resume", replace_hash: str | None = None) -> dict:
     """Parse a resume/CV file (.md, .txt, .docx, or .pdf) into the structured
     format and save it as the master document.
 
-    kind: "resume" (default, saved to resources/master_resume.yaml) or "cv"
-    (saved to resources/master_cv.yaml). Resume and CV are two separate
-    canonical documents -- never mix their content into one file.
+    kind: "resume" (default) or "cv" -- two separate canonical documents in
+    the workspace, never mixed.
 
-    This OVERWRITES the current master for that kind. If one already
-    exists, confirm with the user before calling this rather than silently
-    replacing it (or check resume://versions for anything already saved).
+    If a master of that kind already exists this fails with MASTER_EXISTS.
+    Confirm with the user, then call again with replace_hash set to the
+    current master's hash (from get_master_resume) to replace it; the old
+    one is backed up.
     """
-    if kind not in ("resume", "cv"):
-        raise ValueError("kind must be 'resume' or 'cv'")
-    resume = parsing.parse_resume_file(file_path)
-    storage.save_master(resume, kind)
+    validate_kind(kind)
+    resume = normalize_master(parsing.parse_resume_file(file_path), kind)
+    storage.save_master(kind, resume, replace_hash, "parse_resume import")
     return {
+        "ok": True,
         "kind": kind,
-        "saved_to": str(storage.MASTER_PATHS[kind]),
+        "saved_to": str(_workspace.get_master_path(kind)),
         "name": resume.get("name"),
         "sections_found": [
             k for k in ("summary", "skills", "experience", "education", "projects", "certifications")
@@ -158,6 +260,7 @@ def parse_resume(file_path: str, kind: str = "resume") -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def extract_jd_keywords(jd_text: str, save_as: str | None = None) -> dict:
     """Extract must-have / nice-to-have keywords, title, seniority, and
     years-of-experience signal from a pasted job description.
@@ -172,32 +275,28 @@ def extract_jd_keywords(jd_text: str, save_as: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def match_resume_to_jd(jd_text: str, version: str = "master") -> dict:
     """Compare a resume version against a job description and return a
     deterministic gap analysis: matched / missing / weak keywords and a
     match score. 'weak' means the keyword is only listed under Skills but
     never backed up by an actual experience or project bullet.
     """
-    resume = storage.load_version(version)
-    if resume is None:
-        raise ValueError(f"No resume found for version '{version}'. Run parse_resume first, or check list_versions.")
-    return _match_resume_to_jd(resume, jd_text)
+    return _match_resume_to_jd(_load_readable(version), jd_text)
 
 
 @mcp.tool()
+@_safe_tool
 def get_master_resume(kind: str = "resume") -> dict:
-    """Return the full structured master document as a dict, for editing.
+    """Return the workspace master document plus its hash.
 
     kind: "resume" or "cv" -- these are two separate canonical documents."""
-    if kind not in ("resume", "cv"):
-        raise ValueError("kind must be 'resume' or 'cv'")
-    resume = storage.load_master(kind)
-    if resume is None:
-        raise ValueError(f"No master {kind} yet. Run parse_resume(kind='{kind}') first, or use the create-master-file skill.")
-    return resume
+    resume, master_hash = storage.require_master(validate_kind(kind))
+    return {"ok": True, "kind": kind, "master_hash": master_hash, "master": resume}
 
 
 @mcp.tool()
+@_safe_tool
 def tailor_resume(save_as: str, resume: dict, jd_text: str | None = None, source_version: str = "master") -> dict:
     """Save a tailored resume as a new version.
 
@@ -219,9 +318,15 @@ def tailor_resume(save_as: str, resume: dict, jd_text: str | None = None, source
     if missing_keys:
         raise ValueError(f"resume is missing required keys: {sorted(missing_keys)}")
 
-    storage.save_version(save_as, resume)
+    # Phase-1 bridge: replaced by the patch-based interface in phase 2.
+    ws = _workspace.get_workspace()
+    version_id = _workspace.slugify(save_as)
+    resume = dict(resume)
+    resume["metadata"] = {"version_id": version_id, "workspace_id": ws.id, "document_kind": "resume",
+                          "created_at": _workspace.utc_now_iso()}
+    storage.save_version(version_id, resume)
 
-    result = {"version_id": save_as, "saved_to": str(storage.version_path(save_as))}
+    result = {"ok": True, "version_id": version_id, "saved_to": str(storage.version_path(version_id))}
     if jd_text:
         match = _match_resume_to_jd(resume, jd_text)
         result["match_score"] = match["score"]
@@ -230,15 +335,12 @@ def tailor_resume(save_as: str, resume: dict, jd_text: str | None = None, source
 
 
 @mcp.tool()
+@_safe_tool
 def diff_versions(version_a: str, version_b: str) -> dict:
     """Show a unified diff between two saved resume versions (use 'master'
     for the current master resume)."""
-    a = storage.load_version(version_a)
-    b = storage.load_version(version_b)
-    if a is None:
-        raise ValueError(f"No version '{version_a}'")
-    if b is None:
-        raise ValueError(f"No version '{version_b}'")
+    a = _load_readable(version_a)
+    b = _load_readable(version_b)
 
     a_text = yaml.safe_dump(a, sort_keys=False, allow_unicode=True).splitlines(keepends=True)
     b_text = yaml.safe_dump(b, sort_keys=False, allow_unicode=True).splitlines(keepends=True)
@@ -247,18 +349,17 @@ def diff_versions(version_a: str, version_b: str) -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def score_ats(version: str = "master") -> dict:
     """Run formatting-focused ATS compatibility checks against a resume
     version (standard section headings, bullet length, action-verb starts,
     dates present, etc). This is separate from keyword matching -- use
     match_resume_to_jd for keyword coverage against a specific JD."""
-    resume = storage.load_version(version)
-    if resume is None:
-        raise ValueError(f"No resume found for version '{version}'.")
-    return _score_ats(resume)
+    return _score_ats(_load_readable(version))
 
 
 @mcp.tool()
+@_safe_tool
 def list_templates() -> dict:
     """List all available resume layout templates (id, name, section order,
     and what kind of JD/candidate each one fits best). Use recommend_template
@@ -267,17 +368,18 @@ def list_templates() -> dict:
 
 
 @mcp.tool()
+@_safe_tool
 def recommend_template(jd_text: str, version: str = "master") -> dict:
     """Score every resume template against a job description (and the
     resume's own content, e.g. whether it has certifications or heavily
     quantified bullets) and recommend the best-fitting one. Deterministic --
     no LLM call. Pass the returned recommended_template id to export_resume."""
-    resume = storage.load_version(version)
-    return _templates.recommend_template(jd_text, resume)
+    return _templates.recommend_template(jd_text, _load_readable(version))
 
 
 @mcp.tool(structured_output=False)
-def export_resume(version: str = "master", format: str = "pdf", out_path: str | None = None, template: str = "auto", jd_text: str | None = None):
+@_safe_tool
+def export_resume(version: str = "master", format: str = "pdf", template: str = "auto", jd_text: str | None = None):
     """Export a resume version to a real file.
 
     ALWAYS compiles and returns the PDF + its LaTeX source directly in this
@@ -299,9 +401,9 @@ def export_resume(version: str = "master", format: str = "pdf", out_path: str | 
     Auto-selection needs a JD to score against -- pass jd_text, or it falls
     back to the classic-minimalist default template.
     """
-    resume = storage.load_version(version)
-    if resume is None:
-        raise ValueError(f"No resume found for version '{version}'.")
+    resume = _load_readable(version)
+    export_dir = _workspace.get_exports_path()
+    version = _workspace.validate_id(version or "master", "version")
 
     if template == "auto":
         template_id = _templates.recommend_template(jd_text, resume)["recommended_template"] if jd_text else _templates.DEFAULT_TEMPLATE_ID
@@ -310,8 +412,8 @@ def export_resume(version: str = "master", format: str = "pdf", out_path: str | 
 
     fmt = format.lower().lstrip(".")
 
-    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-    pdf_out_path = out_path if (out_path and fmt == "pdf") else str(EXPORT_DIR / f"{version}.pdf")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    pdf_out_path = str(export_dir / f"{version}.pdf")
 
     pdf_render_template = "classic-minimalist"
     tex_source = _export.to_tex(resume, pdf_render_template)
@@ -324,7 +426,7 @@ def export_resume(version: str = "master", format: str = "pdf", out_path: str | 
     extra_note = ""
     extra_file_line = ""
     if fmt not in ("pdf", "tex"):
-        extra_out_path = out_path or str(EXPORT_DIR / f"{version}.{fmt}")
+        extra_out_path = str(export_dir / f"{version}.{fmt}")
         extra_path = Path(_export_resume(resume, extra_out_path, fmt, template_id)).resolve()
         summary[f"{fmt}_path"] = str(extra_path)
         extra_file_line = f"Also saved {fmt}: {extra_path}\n"
@@ -362,12 +464,14 @@ def export_resume(version: str = "master", format: str = "pdf", out_path: str | 
 
 
 @mcp.tool()
+@_safe_tool
 def list_versions() -> dict:
     """List all saved resume versions (excluding the master)."""
     return {"versions": storage.list_version_ids()}
 
 
 @mcp.tool()
+@_safe_tool
 def list_saved_jds() -> dict:
     """List all job descriptions saved via extract_jd_keywords(save_as=...)."""
     return {"jds": storage.list_jd_ids()}

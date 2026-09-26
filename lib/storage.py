@@ -1,32 +1,39 @@
-"""File-system storage helpers for the structured resume data.
+"""Workspace-backed storage for masters, versions and saved JDs.
 
-Everything is kept as YAML so it's human-readable and diffable with plain
-`git diff` / `cat` if you want to inspect it. `resources/` holds
-source-of-truth reference material (the master resume, the layout
-templates) fetched fresh on every tool call; `data/` holds generated,
-mutable state (tailored versions, saved JDs, exports).
+Everything is YAML so it stays human-readable and diffable. All reads go
+through `yaml_load_file` (safe_load + size and nesting limits); all writes
+are atomic. Master writes are guarded three ways (spec §8, §63):
+
+1. the per-workspace lock,
+2. an optimistic hash check -- the caller passes the hash it read, and the
+   write aborts with MASTER_CONFLICT if the file changed since,
+3. a backup of the previous master before it is replaced.
+
+Versions are write-once: saving an existing version ID fails with
+VERSION_EXISTS, and a released version can never be rewritten.
 """
 
+from __future__ import annotations
+
 from pathlib import Path
-import yaml
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
-BASE_DIR = ROOT_DIR / "data"
-VERSIONS_DIR = BASE_DIR / "versions"
-JD_DIR = BASE_DIR / "jd_history"
+from pydantic import ValidationError
 
-# Resume and CV are two separate canonical master documents -- never mix
-# their content. Each is its own YAML file under resources/.
-MASTER_PATHS = {
-    "resume": ROOT_DIR / "resources" / "master_resume.yaml",
-    "cv": ROOT_DIR / "resources" / "master_cv.yaml",
-}
-MASTER_PATH = MASTER_PATHS["resume"]  # backward-compat alias for existing callers
+from lib import safe_yaml
+from lib.errors import ResumeTailorError
+from lib.locking import atomic_write_yaml, sha256_of, workspace_lock, yaml_dump
+from lib.schemas import MasterDocument, TailoredVersion, validate_kind
+from lib.workspace import Workspace, get_workspace, safe_child, utc_now_iso
 
-# Aliases accepted by load_version for reading a master document by its
-# conventional "version" name (e.g. so export_resume(version="master-cv")
-# works the same way exporting a tailored version does).
-_MASTER_VERSION_ALIASES = {
+MAX_YAML_BYTES = safe_yaml.MAX_YAML_BYTES
+MAX_YAML_DEPTH = safe_yaml.MAX_YAML_DEPTH
+
+# Names that refer to a master when a "version" argument is accepted for a
+# read-only operation (export/validate a master). Masters are never a
+# tailoring *source* through this path -- tailoring loads them via
+# load_master() only.
+MASTER_ALIASES = {
+    "": "resume",
     "master": "resume",
     "master-resume": "resume",
     "master_resume": "resume",
@@ -35,78 +42,226 @@ _MASTER_VERSION_ALIASES = {
 }
 
 
-def ensure_dirs() -> None:
-    VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    JD_DIR.mkdir(parents=True, exist_ok=True)
+def resolve_master_alias(name: str | None) -> str | None:
+    """Return the master kind if `name` is a master alias, else None."""
+    return MASTER_ALIASES.get((name or "").strip())
 
 
-def load_yaml(path: Path):
-    path = Path(path)
-    if not path.exists():
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# --------------------------------------------------------------------------
+# Safe YAML
+# --------------------------------------------------------------------------
+
+def _depth(obj, level: int = 1) -> int:
+    if level > MAX_YAML_DEPTH:
+        return level
+    if isinstance(obj, dict):
+        return max([level] + [_depth(v, level + 1) for v in obj.values()])
+    if isinstance(obj, list):
+        return max([level] + [_depth(v, level + 1) for v in obj])
+    return level
 
 
-def save_yaml(path: Path, data) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True, width=100)
+def check_structure(data) -> None:
+    if _depth(data) > MAX_YAML_DEPTH:
+        raise ResumeTailorError("YAML_TOO_DEEP", f"Document nesting exceeds {MAX_YAML_DEPTH} levels.")
 
 
-def _master_path(kind: str) -> Path:
+def yaml_load_text(text: str):
+    data = safe_yaml.load_text(text)
+    check_structure(data)
+    return data
+
+
+def yaml_load_file(path: Path):
+    data = safe_yaml.load_file(path)
+    if data is not None:
+        check_structure(data)
+    return data
+
+
+# --------------------------------------------------------------------------
+# Masters
+# --------------------------------------------------------------------------
+
+def master_hash(doc: dict | None) -> str | None:
+    return None if doc is None else sha256_of(doc)
+
+
+def load_master(kind: str = "resume", ws: Workspace | None = None) -> tuple[dict | None, str | None]:
+    """Return (master_dict, master_hash); (None, None) if no master yet."""
+    validate_kind(kind)
+    ws = ws or get_workspace()
+    doc = yaml_load_file(ws.master_path(kind))
+    return doc, master_hash(doc)
+
+
+def require_master(kind: str = "resume", ws: Workspace | None = None) -> tuple[dict, str]:
+    doc, h = load_master(kind, ws)
+    if doc is None:
+        raise ResumeTailorError(
+            "MASTER_NOT_FOUND",
+            f"No master {kind} in this workspace yet. Create one with set_master_resume "
+            f"(or the create-master-file skill), or migrate_legacy_data.",
+            details={"kind": kind},
+        )
+    return doc, h
+
+
+def validate_master_doc(doc: dict, kind: str) -> None:
     try:
-        return MASTER_PATHS[kind]
-    except KeyError:
-        raise ValueError(f"Unknown master kind '{kind}' -- use 'resume' or 'cv'.") from None
+        model = MasterDocument.model_validate(doc)
+    except ValidationError as e:
+        raise ResumeTailorError("MASTER_INVALID", "Master does not match the master schema.",
+                                details={"errors": _error_summary(e)}) from None
+    if model.metadata.kind != kind:
+        raise ResumeTailorError("MASTER_INVALID", f"metadata.kind is {model.metadata.kind!r}, expected {kind!r}.")
+    check_structure(doc)
 
 
-def load_master(kind: str = "resume"):
-    return load_yaml(_master_path(kind))
+def save_master(kind: str, doc: dict, expected_hash: str | None, reason: str,
+                ws: Workspace | None = None) -> str:
+    """Atomically write a master. `expected_hash` must be the hash of the
+    master the caller read (None = "I expect no master to exist").
+    Returns the new master hash."""
+    validate_kind(kind)
+    ws = ws or get_workspace()
+    validate_master_doc(doc, kind)
+    path = ws.master_path(kind)
+    with workspace_lock(ws):
+        current, current_hash = load_master(kind, ws)
+        if current is not None and expected_hash is None:
+            raise ResumeTailorError("MASTER_EXISTS", f"A master {kind} already exists; pass its hash to replace it.",
+                                    details={"current_hash": current_hash})
+        if current_hash != expected_hash:
+            raise ResumeTailorError("MASTER_CONFLICT", f"The master {kind} changed since it was read.",
+                                    details={"expected_hash": expected_hash, "current_hash": current_hash})
+        if current is not None:
+            stamp = utc_now_iso().replace(":", "").replace("-", "")
+            backup = ws.backups_dir / f"{kind}-{stamp}-{current_hash[:8]}.yaml"
+            atomic_write_yaml(backup, current)
+        atomic_write_yaml(path, doc)
+        new_hash = master_hash(doc)
+        history_path = ws.master_dir / "history.yaml"
+        history = yaml_load_file(history_path) or []
+        history.append({"at": utc_now_iso(), "kind": kind, "reason": reason,
+                        "previous_hash": current_hash, "new_hash": new_hash})
+        atomic_write_yaml(history_path, history)
+    return new_hash
 
 
-def save_master(data, kind: str = "resume") -> None:
-    save_yaml(_master_path(kind), data)
+# --------------------------------------------------------------------------
+# Versions
+# --------------------------------------------------------------------------
+
+def version_path(version_id: str, ws: Workspace | None = None) -> Path:
+    ws = ws or get_workspace()
+    return safe_child(ws.versions_dir, version_id, ".yaml")
 
 
-def version_path(version_id: str) -> Path:
-    safe_id = version_id.strip().replace("/", "-")
-    return VERSIONS_DIR / f"{safe_id}.yaml"
+def version_exists(version_id: str, ws: Workspace | None = None) -> bool:
+    return version_path(version_id, ws).exists()
 
 
-def load_version(version_id: str):
-    if version_id in (None, ""):
-        return load_master("resume")
-    kind = _MASTER_VERSION_ALIASES.get(version_id)
-    if kind:
-        return load_master(kind)
-    return load_yaml(version_path(version_id))
+def load_version(version_id: str, ws: Workspace | None = None) -> dict | None:
+    """Load a saved tailored version. Master aliases are NOT resolved here."""
+    return yaml_load_file(version_path(version_id, ws))
 
 
-def save_version(version_id: str, data) -> None:
-    save_yaml(version_path(version_id), data)
+def require_version(version_id: str, ws: Workspace | None = None) -> dict:
+    doc = load_version(version_id, ws)
+    if doc is None:
+        raise ResumeTailorError("VERSION_NOT_FOUND", f"No saved version {version_id!r}.",
+                                details={"version_id": version_id})
+    return doc
 
 
-def list_version_ids():
-    ensure_dirs()
-    return sorted(p.stem for p in VERSIONS_DIR.glob("*.yaml"))
+def save_version(version_id: str, doc: dict, ws: Workspace | None = None, *, validate: bool = True) -> Path:
+    """Write-once save. Fails with VERSION_EXISTS if the ID is taken."""
+    ws = ws or get_workspace()
+    path = version_path(version_id, ws)
+    if validate:
+        try:
+            TailoredVersion.model_validate(doc)
+        except ValidationError as e:
+            raise ResumeTailorError("PATCH_INVALID", "Version does not match the version schema.",
+                                    details={"errors": _error_summary(e)}) from None
+    check_structure(doc)
+    with workspace_lock(ws):
+        if path.exists():
+            existing = yaml_load_file(path) or {}
+            if (existing.get("metadata") or {}).get("released"):
+                raise ResumeTailorError("VERSION_RELEASED", f"Version {version_id!r} is released and immutable; "
+                                        "create a new version instead.")
+            raise ResumeTailorError("VERSION_EXISTS", f"Version {version_id!r} already exists; choose a new ID.")
+        atomic_write_yaml(path, doc, exclusive=True)
+    return path
 
 
-def jd_path(jd_id: str) -> Path:
-    safe_id = jd_id.strip().replace("/", "-")
-    return JD_DIR / f"{safe_id}.yaml"
+def update_version_metadata(version_id: str, updates: dict, ws: Workspace | None = None) -> dict:
+    """Metadata-only update for a DRAFT version (e.g. marking it released).
+    Content is never changed through this path; released versions are frozen."""
+    ws = ws or get_workspace()
+    path = version_path(version_id, ws)
+    with workspace_lock(ws):
+        doc = require_version(version_id, ws)
+        meta = doc.setdefault("metadata", {})
+        if meta.get("released"):
+            raise ResumeTailorError("VERSION_RELEASED", f"Version {version_id!r} is released and immutable.")
+        frozen = {"version_id", "workspace_id", "document_kind", "source_master_hash", "workflow_id"} & set(updates)
+        if frozen:
+            raise ResumeTailorError("PATCH_INVALID", "Identity fields of a version cannot be changed.",
+                                    details={"fields": sorted(frozen)})
+        meta.update(updates)
+        if not meta.get("legacy"):
+            try:
+                TailoredVersion.model_validate(doc)
+            except ValidationError as e:
+                raise ResumeTailorError("PATCH_INVALID", "Metadata update breaks the version schema.",
+                                        details={"errors": _error_summary(e)}) from None
+        atomic_write_yaml(path, doc)
+    return doc
 
 
-def save_jd(jd_id: str, jd_text: str, extracted: dict | None = None) -> None:
-    ensure_dirs()
-    save_yaml(jd_path(jd_id), {"jd_text": jd_text, "extracted": extracted or {}})
+def list_version_ids(ws: Workspace | None = None) -> list[str]:
+    ws = ws or get_workspace()
+    if not ws.versions_dir.exists():
+        return []
+    return sorted(p.stem for p in ws.versions_dir.glob("*.yaml"))
 
 
-def load_jd(jd_id: str):
-    return load_yaml(jd_path(jd_id))
+# --------------------------------------------------------------------------
+# Saved JDs
+# --------------------------------------------------------------------------
+
+def jd_path(jd_id: str, ws: Workspace | None = None) -> Path:
+    ws = ws or get_workspace()
+    return safe_child(ws.jd_dir, jd_id, ".yaml")
 
 
-def list_jd_ids():
-    ensure_dirs()
-    return sorted(p.stem for p in JD_DIR.glob("*.yaml"))
+def save_jd(jd_id: str, jd_text: str, extracted: dict | None = None, ws: Workspace | None = None) -> Path:
+    ws = ws or get_workspace()
+    path = jd_path(jd_id, ws)
+    with workspace_lock(ws):
+        atomic_write_yaml(path, {"jd_text": jd_text, "extracted": extracted or {}})
+    return path
+
+
+def load_jd(jd_id: str, ws: Workspace | None = None):
+    return yaml_load_file(jd_path(jd_id, ws))
+
+
+def list_jd_ids(ws: Workspace | None = None) -> list[str]:
+    ws = ws or get_workspace()
+    if not ws.jd_dir.exists():
+        return []
+    return sorted(p.stem for p in ws.jd_dir.glob("*.yaml"))
+
+
+def dump_yaml(data) -> str:
+    return yaml_dump(data)
+
+
+def _error_summary(e: ValidationError, limit: int = 10) -> list[dict]:
+    # Field locations and messages only -- never the offending input values,
+    # which may contain personal data.
+    return [{"loc": ".".join(str(p) for p in err["loc"]), "msg": err["msg"]} for err in e.errors()[:limit]]

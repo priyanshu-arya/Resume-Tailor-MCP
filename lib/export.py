@@ -7,6 +7,7 @@ from pathlib import Path
 
 from lib import templates as _templates
 from lib import latex as _latex
+from lib.ids import cert_text, skill_names
 from lib.links import linkedin_label, normalize_url
 
 TECTONIC_BIN = Path(__file__).resolve().parent.parent / "bin" / "tectonic"
@@ -40,7 +41,7 @@ def _md_skills(resume: dict) -> list[str]:
         return []
     lines = ["## Skills"]
     for group in resume["skills"]:
-        items = ", ".join(group.get("items", []))
+        items = ", ".join(skill_names(group))
         lines.append(f"- {group.get('category', 'General')}: {items}")
     lines.append("")
     return lines
@@ -89,7 +90,7 @@ def _md_certifications(resume: dict) -> list[str]:
         return []
     lines = ["## Certifications"]
     for cert in resume["certifications"]:
-        lines.append(f"- {cert}")
+        lines.append(f"- {cert_text(cert)}")
     lines.append("")
     return lines
 
@@ -253,7 +254,7 @@ def _docx_skills(document, resume: dict, template_id: str | None) -> None:
     if resume.get("skills"):
         _docx_heading(document, "Skills", template_id)
         for group in resume["skills"]:
-            items = ", ".join(group.get("items", []))
+            items = ", ".join(skill_names(group))
             document.add_paragraph(f"{group.get('category', 'General')}: {items}", style="List Bullet")
 
 
@@ -295,7 +296,7 @@ def _docx_certifications(document, resume: dict, template_id: str | None) -> Non
     if resume.get("certifications"):
         _docx_heading(document, "Certifications", template_id)
         for cert in resume["certifications"]:
-            document.add_paragraph(cert, style="List Bullet")
+            document.add_paragraph(cert_text(cert), style="List Bullet")
 
 
 _DOCX_SECTION_RENDERERS = {

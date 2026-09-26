@@ -1,12 +1,13 @@
 """Deterministic gap analysis between a structured resume and JD keywords."""
 
+from .ids import cert_text, skill_names
 from .keywords import extract_jd_keywords
 
 
 def _skills_blob(resume: dict) -> str:
     parts = []
     for skill_group in resume.get("skills", []):
-        parts.extend(skill_group.get("items", []))
+        parts.extend(skill_names(skill_group))
     return " \n ".join(parts).lower()
 
 
@@ -23,7 +24,7 @@ def _proof_blob(resume: dict) -> str:
         for b in proj.get("bullets", []):
             parts.append(b.get("text", "") if isinstance(b, dict) else str(b))
     for cert in resume.get("certifications", []):
-        parts.append(cert if isinstance(cert, str) else str(cert))
+        parts.append(cert_text(cert))
     return " \n ".join(p for p in parts if p).lower()
 
 

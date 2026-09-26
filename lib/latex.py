@@ -6,6 +6,7 @@ straight from this generated .tex, so the two can never drift apart.
 
 from __future__ import annotations
 
+from lib.ids import cert_text, skill_names
 from lib.links import linkedin_label, normalize_url
 
 _SPECIAL_CHARS = {
@@ -194,7 +195,7 @@ def _section_skills(resume: dict) -> str:
     rows = []
     for group in resume["skills"]:
         category = esc(group.get("category", "General"))
-        items = esc(", ".join(group.get("items", [])))
+        items = esc(", ".join(skill_names(group)))
         rows.append(f"     \\textbf{{{category}}}{{: {items}}} \\\\")
     body = " \\vspace{1pt}\n".join(rows)
     return (
@@ -224,7 +225,7 @@ def _section_education(resume: dict) -> str:
 def _section_certifications(resume: dict) -> str:
     if not resume.get("certifications"):
         return ""
-    items = " $\\bullet$ ".join(esc(c) for c in resume["certifications"])
+    items = " $\\bullet$ ".join(esc(cert_text(c)) for c in resume["certifications"])
     return (
         "\\section{Certifications}\n"
         f"\\small{{{items}}}\n\n"
