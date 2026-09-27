@@ -216,6 +216,7 @@ def _export_basename(master: dict, workflow: dict, kind: str, version_id: str, w
 
 def release_resume(version_id: str, workflow_id: str, ws: Workspace | None = None) -> dict:
     ws = ws or get_workspace()
+    workflows.check_workflow_id(workflow_id)
     with workspace_lock(ws):
         current = storage.require_version(version_id, ws)
         if (current.get("metadata") or {}).get("released"):

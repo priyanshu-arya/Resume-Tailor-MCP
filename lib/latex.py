@@ -74,17 +74,17 @@ _PREAMBLE = r"""\documentclass[letterpaper,11pt]{article}
 
 \newcommand{\resumeSubheading}[4]{
   \item
-    \begin{tabular*}{\linewidth}[t]{l@{\extracolsep{\fill}}r}
+    \begin{tabularx}{\linewidth}[t]{@{}X@{\hspace{0.5em}}r@{}}
       \textbf{#1} & #2 \\
       \textit{\small#3} & \textit{\small #4} \\
-    \end{tabular*}\vspace{2pt}
+    \end{tabularx}\vspace{2pt}
 }
 
 \newcommand{\resumeProjectHeading}[2]{
     \item
-    \begin{tabular*}{\linewidth}{l@{\extracolsep{\fill}}r}
+    \begin{tabularx}{\linewidth}{@{}X@{\hspace{0.5em}}r@{}}
       \small#1 & #2 \\
-    \end{tabular*}\vspace{2pt}
+    \end{tabularx}\vspace{2pt}
 }
 
 \newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}

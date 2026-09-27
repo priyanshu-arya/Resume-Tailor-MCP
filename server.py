@@ -15,8 +15,10 @@ from __future__ import annotations
 import base64
 import difflib
 import functools
+import inspect
 import json
 import sys
+import time
 from datetime import date
 from pathlib import Path
 
@@ -43,19 +45,123 @@ ETIQUETTE_PATH = Path(__file__).resolve().parent / "resources" / "resume_etiquet
 # Resources -- read-only, URI-addressable state
 # --------------------------------------------------------------------------
 
+def _audit(_channel: str, _event: str, **fields) -> None:
+    """Best-effort structured audit event (IDs/counts/codes only). Logging
+    must never change a tool's outcome."""
+    try:
+        from lib import audit
+        (audit.log_error if _channel == "error" else audit.log_event)(_event, **fields)
+    except ValueError:
+        raise  # unknown event name: a programming error, surface it in tests
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _count(items, prefix):
+    return sum(1 for c in items or [] if str(c.get("id", "")).startswith(prefix))
+
+
+def _validation_fields(result: dict) -> dict:
+    fails = result.get("critical_failures") or []
+    return {
+        "status": "passed" if result.get("passed") else "failed",
+        "critical_count": len(fails),
+        "warning_count": len(result.get("warnings") or []),
+        "template_failures": _count(fails, "template."),
+        "pdf_failures": _count(fails, "pdf.") + _count(fails, "latex."),
+        "pdf_checked": "pdf" not in (result.get("not_available") or []) and not _count(fails, "pdf.backend"),
+        "rule_ids": [c["id"] for c in fails][:20],
+    }
+
+
+def _success_events(name: str, args: dict, result) -> list[tuple[str, dict]]:
+    if not isinstance(result, dict):
+        if name == "export_resume":
+            return [("export_completed", {"version_id": args.get("version"), "mode": args.get("mode"),
+                                          "format": args.get("format")})]
+        return []
+    wf = args.get("workflow_id") or result.get("workflow_id")
+    if name == "initialize_workspace" and result.get("created"):
+        return [("workspace_initialized", {})]
+    if name == "migrate_legacy_data":
+        statuses = [m.get("status") for m in (result.get("masters") or {}).values()]
+        return [("legacy_migrated", {"migrated_count": sum(s in ("migrated", "replaced") for s in statuses),
+                                     "conflict_count": statuses.count("conflict")})]
+    if name == "set_master_resume":
+        return [("master_updated", {"kind": args.get("kind"), "applied": bool(result.get("applied")),
+                                    "master_hash": result.get("master_hash")})]
+    if name == "analyze_tailoring_requirements":
+        events = [] if args.get("workflow_id") else [("workflow_started", {"workflow_id": wf,
+                                                                           "kind": args.get("source_kind")})]
+        return events + [("requirements_analyzed", {
+            "workflow_id": wf, "evidence_prompt_count": len(result.get("evidence_prompts") or []),
+            "missing_count": len(result.get("missing") or []),
+            "unknown_count": len(result.get("unknown_requirements") or [])})]
+    if name == "save_tailoring_evidence":
+        return [("evidence_saved", {"workflow_id": wf, "evidence_id": (result.get("evidence") or {}).get("id")})]
+    if name == "tailor_resume":
+        return [("tailor_succeeded", {"workflow_id": wf, "version_id": result.get("version_id"),
+                                      "patch_count": len(args.get("patches") or []),
+                                      "repair_attempt": 1 if args.get("repair_of") else 0,
+                                      "template_id": result.get("template_id"),
+                                      "source_master_hash": result.get("source_master_hash")})]
+    if name == "validate_version":
+        return [("validation_completed", {"workflow_id": wf, "version_id": args.get("version_id"),
+                                          **_validation_fields(result)})]
+    if name == "release_resume" and not result.get("already_released"):
+        base = {"workflow_id": wf, "version_id": args.get("version_id")}
+        events = [("validation_completed", {**base, **_validation_fields(result)})]
+        if result.get("released"):
+            events.append(("release_succeeded", {**base, "release_report_id": result.get("release_report_id"),
+                                                 "tex_sha256": result.get("tex_sha256"),
+                                                 "pdf_sha256": result.get("pdf_sha256")}))
+        else:
+            fails = result.get("critical_failures") or []
+            events.append(("release_blocked", {**base, "status": "blocked", "critical_count": len(fails),
+                                               "category": fails[0]["category"] if fails else None,
+                                               "rule_ids": [c["id"] for c in fails][:20]}))
+        return events
+    return []
+
+
 def _safe_tool(fn):
-    """Uniform error model (spec §69): business failures become
-    {"ok": false, "error": {...}}; anything unexpected becomes a generic
-    INTERNAL_ERROR with no paths or personal data in the response."""
+    """Uniform error model (spec §69) plus audit events (spec §49):
+    business failures become {"ok": false, "error": {...}}; anything
+    unexpected becomes a generic INTERNAL_ERROR with no paths or personal
+    data in the response. Every outcome is logged by ID/count/code only."""
+    signature = inspect.signature(fn)
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
-            return fn(*args, **kwargs)
+            bound = signature.bind(*args, **kwargs)
+            bound.apply_defaults()
+            call_args = dict(bound.arguments)
+        except TypeError:
+            call_args = dict(kwargs)
+        name = fn.__name__
+        started = time.monotonic()
+        try:
+            result = fn(*args, **kwargs)
         except ResumeTailorError as e:
+            fields = {"tool": name, "workflow_id": call_args.get("workflow_id"), "code": e.code,
+                      "category": e.category, "severity": e.severity, "status": "failed",
+                      "duration_ms": int((time.monotonic() - started) * 1000)}
+            rejections = (e.details or {}).get("rejections") or []
+            if name == "tailor_resume" and e.code in ("PATCH_INVALID", "PROVENANCE_VIOLATION"):
+                _audit("error", "tailor_rejected", **fields, rejection_count=len(rejections),
+                       rule_ids=[r.get("rule") for r in rejections if r.get("rule")][:20])
+            else:
+                _audit("error", "tool_error", **fields)
             return e.to_result()
         except Exception as e:  # noqa: BLE001 - last-resort boundary
-            print(f"resume-tailor: internal error in {fn.__name__}: {type(e).__name__}", file=sys.stderr)
+            print(f"resume-tailor: internal error in {name}: {type(e).__name__}", file=sys.stderr)
+            _audit("error", "internal_error", tool=name, workflow_id=call_args.get("workflow_id"),
+                   error_class=type(e).__name__, category="WORKFLOW", severity="critical", status="failed")
             return internal_error_result()
+        for event, fields in _success_events(name, call_args, result):
+            _audit("event", event, tool=name, duration_ms=int((time.monotonic() - started) * 1000), **fields)
+        return result
     return wrapper
 
 
@@ -464,6 +570,38 @@ def export_resume(version: str, workflow_id: str | None = None, format: str = "p
             ),
         ),
     ]
+
+
+@mcp.tool()
+@_safe_tool
+def get_workflow_status(workflow_id: str | None = None) -> dict:
+    """Status of one tailoring workflow (evidence, versions with released
+    state, repair attempts, last status, audit summary), or -- with no
+    workflow_id -- the list of workflow IDs plus system reliability metrics
+    rebuilt from the audit log. Metrics describe the software, never the
+    candidate."""
+    from lib import metrics, workflows
+    if not workflow_id:
+        return {"ok": True, "workflows": workflows.list_workflow_ids(), "metrics": metrics.rebuild_metrics()}
+    wf = workflows.load_workflow(workflows.check_workflow_id(workflow_id))
+    versions = []
+    for vid in wf.get("version_ids") or []:
+        meta = (storage.load_version(vid) or {}).get("metadata") or {}
+        versions.append({"version_id": vid, "released": bool(meta.get("released")),
+                         "release_report_id": meta.get("release_report_id"), "template_id": meta.get("template_id"),
+                         "repair_of": meta.get("repair_of")})
+    return {
+        "ok": True,
+        "workflow_id": workflow_id,
+        "source_kind": wf["source_kind"],
+        "status": wf.get("status"),
+        "created_at": wf.get("created_at"),
+        "evidence_ids": wf.get("evidence_ids", []),
+        "versions": versions,
+        "repair_attempts": wf.get("repair_attempts", 0),
+        "analysis": wf.get("analysis", {}),
+        "audit": metrics.workflow_summary(workflow_id),
+    }
 
 
 @mcp.tool()

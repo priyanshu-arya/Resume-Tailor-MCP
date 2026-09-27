@@ -84,7 +84,7 @@ templates:
       tables_allowed: false
       text_boxes_allowed: false
       graphics_allowed: false
-      layout_only_exceptions: ["tabular* in entry headings (title/date alignment only)"]
+      layout_only_exceptions: ["tabularx in entry headings (title/date alignment only; title column wraps)"]
       style: >
         The production layout: rendered by lib/latex.py and compiled to PDF
         with tectonic. It is the only template with a renderer; it is never

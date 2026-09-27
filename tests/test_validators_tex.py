@@ -91,7 +91,7 @@ def test_includegraphics_fails(tex):
 
 
 def test_tabular_in_content_fails_but_layout_macros_are_allowed(tex):
-    assert r"\begin{tabular*}" in tex  # the allowed layout-only macros
+    assert r"\begin{tabularx}" in tex  # the allowed layout-only macros
     t = tex.replace(r"\section{Education}", "\\begin{tabular}{ll} a & b \\\\ \\end{tabular}\n\\section{Education}", 1)
     checks, inferred = _run(t)
     assert checks["template.forbidden_structures"].status == "fail" and inferred["forbidden"] == ["tabular"]
