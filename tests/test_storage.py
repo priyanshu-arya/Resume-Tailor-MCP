@@ -464,3 +464,83 @@ def test_jd_traversal(workspace):
             storage.save_jd(bad, "t", None, workspace)
         with pytest.raises(ResumeTailorError):
             storage.load_jd(bad, workspace)
+
+
+# --------------------------------------------------------------------------
+# require_master message (R-USER-12) and master history (R-USER-11)
+# --------------------------------------------------------------------------
+
+def test_require_master_message_refuses_memory_substitute(workspace):
+    with pytest.raises(ResumeTailorError) as ei:
+        storage.require_master("resume", workspace)
+    msg = ei.value.message.lower()
+    assert "memory" in msg
+    assert "previous tailored version" in msg
+    assert "another workspace" in msg
+    assert "discover_masters" in ei.value.message
+    assert ei.value.details["workspace_id"] == workspace.id
+
+
+def test_history_records_every_master_write(master):
+    ws, doc, h = master
+    storage.save_master("resume", doc, h, "second write", ws=ws)
+    hist = storage.read_master_history("resume", ws=ws)
+    assert len(hist) == 2
+    assert hist[0]["reason"] == "second write"  # newest first
+    assert hist[1]["reason"] == "test fixture"
+
+
+def test_history_filtered_by_kind(master):
+    ws, doc, h = master
+    from lib.ids import normalize_master
+    cv_doc = normalize_master({"name": "Alex", "unparsed": []}, "cv")
+    storage.save_master("cv", cv_doc, None, "cv write", ws=ws)
+    resume_hist = storage.read_master_history("resume", ws=ws)
+    cv_hist = storage.read_master_history("cv", ws=ws)
+    assert all(h["kind"] == "resume" for h in resume_hist)
+    assert all(h["kind"] == "cv" for h in cv_hist)
+    assert len(cv_hist) == 1
+
+
+def test_history_records_import_provenance(master):
+    ws, doc, h = master
+    doc2 = dict(doc)
+    doc2["metadata"] = dict(doc["metadata"])
+    doc2["metadata"]["imported"] = {
+        "source": "user_folder", "source_filename": "resume.md",
+        "source_folder_name": "my-folder", "source_folder_hash": "abc123",
+        "source_hash": "def456",
+    }
+    storage.save_master("resume", doc2, h, "import", ws=ws)
+    hist = storage.read_master_history("resume", ws=ws)
+    assert hist[0]["source_filename"] == "resume.md"
+    assert hist[0]["source_folder_hash"] == "abc123"
+
+
+def test_history_without_import_has_no_source_fields(master):
+    ws, doc, h = master
+    hist = storage.read_master_history("resume", ws=ws)
+    assert "source_filename" not in hist[0]
+
+
+def test_read_master_history_empty_when_no_writes(workspace):
+    assert storage.read_master_history("resume", ws=workspace) == []
+
+
+def test_read_master_history_contains_no_resume_content(master):
+    ws, doc, h = master
+    hist = storage.read_master_history("resume", ws=ws)
+    import json
+    blob = json.dumps(hist)
+    assert doc["name"] not in blob
+    assert doc["summary"] not in blob
+
+
+def test_read_master_history_takes_no_lock(master):
+    # if read_master_history tried to take workspace_lock while already
+    # inside one, this would deadlock/hang instead of returning
+    from lib.locking import workspace_lock
+    ws, doc, h = master
+    with workspace_lock(ws):
+        result = storage.read_master_history("resume", ws=ws)
+    assert len(result) == 1

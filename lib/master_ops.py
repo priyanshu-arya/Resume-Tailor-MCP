@@ -42,6 +42,39 @@ CONTENT_SECTIONS = ("summary", "skills", "experience", "education", "projects", 
 NEXT_STEP = ("Show the diff to the user; if they approve call again with confirm=True, "
              "expected_hash=current_hash, proposed_hash=proposed_hash.")
 
+# Metadata a caller may never supply directly -- it is server-derived
+# provenance, not something a resume dict or file import can forge.
+_SERVER_OWNED_METADATA = ("migration", "imported", "id_counters")
+
+# Markers that identify a TAILORED VERSION document, not a master. A version
+# is an OUTPUT of the master; promoting one to master would make the master a
+# derivative of itself and destroy its own provenance (R-USER-03).
+_VERSION_MARKERS = ("version_id", "released", "release_report_id", "source_master_hash",
+                    "document_kind", "template_id", "template_version", "evidence_ids",
+                    "repair_of", "workflow_id", "legacy", "summary_source_refs",
+                    "summary_claim_strength")
+
+
+def _reject_version_document(raw: dict) -> None:
+    """Refuse a tailored version dict passed as `resume=`. Without this,
+    normalize_master forces metadata.kind and MasterMetadata's extra="allow"
+    lets every version-only field survive validation, so a version could
+    silently become the master (see docs/baseline.md defect D-2)."""
+    if not isinstance(raw, dict):
+        return
+    meta = raw.get("metadata")
+    if not isinstance(meta, dict):
+        return
+    found = sorted(set(_VERSION_MARKERS) & set(meta))
+    if found:
+        raise _invalid(
+            "This looks like a tailored version, not a master. A version is an OUTPUT of the "
+            "master and can never become one: promoting it would make the master a derivative "
+            "of itself and destroy its provenance. Author the master from the user's own source "
+            "material (set_master_resume with file_path, import_master_from_folder, or the "
+            "create-master-file skill).",
+            version_fields=found)
+
 
 # --------------------------------------------------------------------------
 # Readiness
@@ -105,12 +138,18 @@ def _raw_input(file_path, resume) -> tuple[dict, str]:
 def _seed_metadata(raw: dict, current: dict | None, mode: str) -> dict:
     """Metadata the candidate starts from, before IDs are assigned."""
     cand_meta = dict(raw.get("metadata") or {})
+    for key in _SERVER_OWNED_METADATA:  # a caller cannot forge provenance
+        cand_meta.pop(key, None)
     cur_meta = dict((current or {}).get("metadata") or {})
     if current is None:
         return cand_meta
     cand_meta["id_counters"] = _merge_counters(cur_meta.get("id_counters"), cand_meta.get("id_counters"))
     if cur_meta.get("migration") is not None:
         cand_meta["migration"] = copy.deepcopy(cur_meta["migration"])
+    if mode == "update" and cur_meta.get("imported") is not None:
+        # carry import provenance forward on update only -- on replace the
+        # document is new, so stale provenance from a previous file would lie
+        cand_meta["imported"] = copy.deepcopy(cur_meta["imported"])
     if mode == "update":
         for key in ("career_stage", "unparsed_accepted"):
             if key in cur_meta:
@@ -119,7 +158,8 @@ def _seed_metadata(raw: dict, current: dict | None, mode: str) -> dict:
 
 
 def build_candidate(kind: str, raw: dict, current: dict | None, mode: str,
-                    career_stage: str | None, accept_unparsed: bool) -> dict:
+                    career_stage: str | None, accept_unparsed: bool,
+                    import_info: dict | None = None) -> dict:
     """Pure: raw resume dict + current master -> normalized candidate master."""
     raw = copy.deepcopy(raw or {})
     raw["metadata"] = _seed_metadata(raw, current, mode)
@@ -129,6 +169,11 @@ def build_candidate(kind: str, raw: dict, current: dict | None, mode: str,
         meta["career_stage"] = career_stage
     if accept_unparsed:
         meta["unparsed_accepted"] = True
+    if import_info is not None:
+        # set before hashing (the caller hashes build_candidate's return
+        # value for the preview/confirm protocol) so the same import_info
+        # dict on the second call reproduces the exact same candidate_hash
+        meta["imported"] = import_info
     ids.assign_ids(candidate)  # idempotent; fills anything still missing above the high-water mark
     return candidate
 
@@ -161,9 +206,13 @@ def _applied_result(kind: str, doc: dict, new_hash: str) -> dict:
         note = (f"Master saved, but it is NOT ready for tailoring: {r['unparsed_items']} unparsed item(s) "
                 "must be placed into the proper sections (update the master), or the user must explicitly "
                 "accept leaving them out (call again with accept_unparsed=True).")
-    return {"ok": True, "applied": True, "kind": kind, "master_hash": new_hash,
-            "master_ready": r["ready"], "unparsed_items": r["unparsed_items"],
-            "sections_found": _sections_found(doc), "note": note}
+    result = {"ok": True, "applied": True, "kind": kind, "master_hash": new_hash,
+             "master_ready": r["ready"], "unparsed_items": r["unparsed_items"],
+             "sections_found": _sections_found(doc), "note": note}
+    imported = (doc.get("metadata") or {}).get("imported")
+    if imported is not None:
+        result["import_provenance"] = imported
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -173,10 +222,17 @@ def _applied_result(kind: str, doc: dict, new_hash: str) -> dict:
 def set_master(kind: str, *, file_path: str | None = None, resume: dict | None = None,
                mode: str = "replace", expected_hash: str | None = None, confirm: bool = False,
                proposed_hash: str | None = None, career_stage: str | None = None,
-               accept_unparsed: bool = False, ws=None) -> dict:
+               accept_unparsed: bool = False, import_info: dict | None = None, ws=None) -> dict:
     """Create, replace or update a master. See the module docstring for the
-    preview -> confirm protocol."""
+    preview -> confirm protocol.
+
+    `import_info` is set by the folder-discovery import path
+    (lib.discovery.import_master) to record where the file came from
+    (R-USER-11); it is never accepted from the resume body itself -- see
+    _SERVER_OWNED_METADATA."""
     _validate_args(kind, file_path, resume, mode, career_stage)
+    if resume is not None:
+        _reject_version_document(resume)
     current, current_hash = storage.load_master(kind, ws)
     if mode == "update":
         if current is None:
@@ -185,7 +241,7 @@ def set_master(kind: str, *, file_path: str | None = None, resume: dict | None =
     else:
         raw, reason = _raw_input(file_path, resume)
 
-    candidate = build_candidate(kind, raw, current, mode, career_stage, accept_unparsed)
+    candidate = build_candidate(kind, raw, current, mode, career_stage, accept_unparsed, import_info)
     storage.validate_master_doc(candidate, kind)  # never preview something that can't be saved
     candidate_hash = sha256_of(candidate)
 

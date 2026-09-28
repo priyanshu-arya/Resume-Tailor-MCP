@@ -19,16 +19,17 @@ from __future__ import annotations
 import json
 import secrets
 import shutil
+import time
 from pathlib import Path
 
-from lib import storage, workflows
+from lib import audit, storage, workflows
 from lib import export as _export
 from lib import filenames as _filenames
 from lib import templates as _templates
 from lib.errors import ResumeTailorError
 from lib.ids import index_blocks
 from lib.locking import atomic_write_bytes, sha256_bytes, sha256_of, sha256_text, workspace_lock
-from lib.schemas import Check, ReleaseReport, ValidationReport
+from lib.schemas import Check, ReleaseReport, ValidationReport, contract_gaps
 from lib.validators import content as _content
 from lib.validators import format_tex as _format_tex
 from lib.validators import pdf as _pdf
@@ -38,7 +39,35 @@ from lib.workspace import Workspace, get_workspace, safe_child, utc_now_iso
 # Page caps by career stage (CLAUDE.md strict rules). None = no corporate cap.
 STAGE_MAX_PAGES = {"fresher": 1, "1-3": 1, "3-5": 2, "5-10": 2, "manager": 2, "director": 3, "academic": None}
 
+# Every check this module emits directly (as opposed to the four dedicated
+# validators in lib/validators/), in report order. These are the checks
+# that only the release gate itself can run: they need the live master, the
+# resolved template contract, or the actual compile step, not just the
+# rendered document.
+ALL_CHECK_IDS = (
+    "source.master_hash",
+    "provenance.replay",
+    "template.releasable",
+    "release.career_stage",
+    "template.renderer",
+    "latex.compile",
+    "pdf.backend",
+)
+
 DRAFT_LABEL = "DRAFT / UNVERIFIED -- not released, not validated for submission"
+
+
+def _log_pdf_compiled(ws, workflow_id, **fields) -> None:
+    """Best-effort emission from inside the compile step (the server wrapper
+    only sees the aggregate outcome, not this stage). Re-raises ValueError
+    (unknown event = programming error); swallows everything else -- a
+    logging failure must never change a release outcome."""
+    try:
+        audit.log_event("pdf_compiled", ws=ws, workflow_id=workflow_id, **fields)
+    except ValueError:
+        raise
+    except Exception:  # noqa: BLE001 - logging must never break a release
+        pass
 
 
 def _check(id_, status, severity, category, message, source="release_gate", measurement=None, expected=None) -> Check:
@@ -66,6 +95,18 @@ def page_cap(contract: dict, master: dict) -> tuple[int | None, Check]:
     stage_max = STAGE_MAX_PAGES.get(stage)
     caps = [c for c in (contract_max, stage_max) if c]
     cap = min(caps) if caps else None
+    # Non-blocking visibility fix: when the template's own limit is what's
+    # actually binding (stage allows more pages than the template caps at),
+    # a "pass"/"info" here would let e.g. a director's cut-off third page
+    # look like a passing check. Surface it as a warning instead -- no
+    # release outcome changes, only what the user is told.
+    template_is_binding = contract_max is not None and (stage_max is None or contract_max < stage_max)
+    if template_is_binding:
+        return cap, _check("release.career_stage", "warning", "warning", "FORMAT",
+                           f"Page cap {cap} comes from the template, not your career stage: career_stage "
+                           f"{stage!r} allows {stage_max} page(s) but the template declares max_pages "
+                           f"{contract_max}. Content must fit {cap} page(s). Never shrink margins or type to fit.",
+                           measurement=stage, expected=cap)
     return cap, _check("release.career_stage", "pass", "info", "FORMAT",
                        f"Page cap {cap} (template {contract_max}, career stage {stage!r} -> {stage_max}).",
                        measurement=stage, expected=cap)
@@ -91,6 +132,28 @@ def _replay_check(version: dict, master: dict, evidence: dict, ws: Workspace) ->
                       source="provenance")
     return _check("provenance.replay", "pass", "critical", "FACTUAL",
                   "Version reproduces exactly from the master and its validated patches.", source="provenance")
+
+
+def _rules_version_drift_check(meta: dict) -> Check:
+    """Non-blocking: a rules_version bump can make an in-flight draft fail
+    provenance.replay at validate/release time if a new rule rejects one of
+    its recorded patches. That surfaces as a generic 'recorded patches no
+    longer validate' critical failure that repairs cannot fix -- this warning
+    makes the cause legible instead."""
+    from lib import rules
+    try:
+        current = rules.rules_version()
+    except ResumeTailorError:
+        return _check("release.rules_version_drift", "not_available", "warning", "WORKFLOW",
+                      "Current rules_version is unavailable.")
+    recorded = meta.get("rules_version")
+    if recorded and recorded != current:
+        return _check("release.rules_version_drift", "warning", "warning", "WORKFLOW",
+                      f"Tailored under rules_version {recorded!r}; the workspace now runs {current!r}. "
+                      "If provenance.replay fails on this version, re-tailor rather than repair.",
+                      measurement=recorded, expected=current)
+    return _check("release.rules_version_drift", "pass", "warning", "WORKFLOW",
+                  "Version was tailored under the current rules_version.", measurement=recorded, expected=current)
 
 
 def _load_context(version_id: str, workflow_id: str, ws: Workspace):
@@ -126,11 +189,12 @@ def validate(version_id: str, workflow_id: str, ws: Workspace | None = None) -> 
     else:
         checks.append(_check("source.master_hash", "pass", "critical", "SOURCE", "Version derives from the current master."))
         checks.append(_replay_check(version, master, evidence, ws))
+    checks.append(_rules_version_drift_check(meta))
 
     # --- template ---
     template_id = meta.get("template_id")
     info = _templates.resolve_template(template_id)  # TEMPLATE_UNKNOWN propagates: never guess
-    contract = _templates.get_contract(template_id)
+    contract = _templates.get_contract(template_id)  # TEMPLATE_REGISTRY_INVALID propagates for a malformed entry
     if info["releasable"]:
         checks.append(_check("template.releasable", "pass", "critical", "TEMPLATE",
                              f"{template_id} v{info['version']} is supported with a production renderer."))
@@ -139,6 +203,19 @@ def validate(version_id: str, workflow_id: str, ws: Workspace | None = None) -> 
                              f"{template_id} is {info['status']}"
                              f"{'' if info['has_renderer'] else ' and has no production renderer'}; it cannot be "
                              "released. Choose a supported template (e.g. classic-minimalist) -- nothing was substituted."))
+
+    gaps = contract_gaps(contract) if info["releasable"] else None
+    if not info["releasable"]:
+        checks.append(_check("template.contract_complete", "not_available", "error", "TEMPLATE",
+                             "Not checked: the template is not releasable."))
+    elif gaps:
+        checks.append(_check("template.contract_complete", "fail", "critical", "TEMPLATE",
+                             f"{template_id} is marked supported but its contract is incomplete ({len(gaps)} "
+                             "fields unknown); format checks would silently degrade to not_available. Restore "
+                             "resources/templates/templates.yaml.", measurement=gaps))
+    else:
+        checks.append(_check("template.contract_complete", "pass", "critical", "TEMPLATE",
+                             f"{template_id}'s contract fully specifies every required field."))
 
     # --- content / structure ---
     checks += _content.check_content(version)
@@ -157,16 +234,24 @@ def validate(version_id: str, workflow_id: str, ws: Workspace | None = None) -> 
         tex = _templates.render_template(template_id, version)
         tex_checks, inferred = _format_tex.check_tex(tex, contract)
         checks += tex_checks
+        compile_started = time.monotonic()
         try:
             compile_info = _export.compile_tex(tex, _staging_dir(ws, version_id), version_id)
         except ResumeTailorError as e:
             checks.append(_check("latex.compile", "fail", "critical", "LATEX_PDF", f"LaTeX compilation failed ({e.code})."))
+            _log_pdf_compiled(ws, workflow_id, status="fail",
+                              duration_ms=int((time.monotonic() - compile_started) * 1000),
+                              code=e.code, category="LATEX_PDF")
         else:
             checks.append(_check("latex.compile", "pass", "critical", "LATEX_PDF", "Compiled the exact returned TeX."))
             pdf_path = compile_info["pdf_path"]
             pdf_checks, measured, na = _pdf.check_pdf(pdf_path, contract, version, cap or 99, compile_info, backend)
             checks += pdf_checks
             not_available += na
+            _log_pdf_compiled(ws, workflow_id, status="pass",
+                              duration_ms=int((time.monotonic() - compile_started) * 1000),
+                              page_count=measured.get("page_count"),
+                              overfull_count=compile_info.get("overfull_hbox_count"))
     if not backend.get("available"):
         checks.append(_check("pdf.backend", "fail", "critical", "LATEX_PDF", backend.get("message") or
                              "PDF validation unavailable. Production release blocked."))
@@ -180,6 +265,18 @@ def validate(version_id: str, workflow_id: str, ws: Workspace | None = None) -> 
     workflows.update_workflow(workflow_id, ws=ws, set_fields={"status": "validated" if report.passed else "blocked"})
     return {"report": report, "tex": tex, "compile_info": compile_info, "master": master, "meta": meta,
             "workflow": workflow}
+
+
+def lifecycle_state(meta: dict) -> str:
+    """Derived, non-persisted DRAFT/RELEASED state (spec §38, Phase 6
+    lifecycle decision). There is deliberately no stored per-version
+    `validated` flag: `validate_version` writes nothing version-scoped, and
+    `release_resume` always re-validates fully under `workspace_lock` before
+    freezing a version, so a stored "validated: true" would only ever be
+    trusted *less* than what the gate already recomputes on demand. The
+    three-state DRAFT -> VALIDATED -> RELEASED lifecycle collapses here to
+    two: validation is a stateless, repeatable action, not a state."""
+    return "released" if meta.get("released") else "draft"
 
 
 def report_summary(report: ValidationReport) -> dict:
@@ -198,8 +295,11 @@ def report_summary(report: ValidationReport) -> dict:
 
 
 def validate_version(version_id: str, workflow_id: str, ws: Workspace | None = None) -> dict:
+    from lib import reporting
     result = validate(version_id, workflow_id, ws)
-    return {"ok": True, "version_id": version_id, "workflow_id": workflow_id, **report_summary(result["report"])}
+    return {"ok": True, "version_id": version_id, "workflow_id": workflow_id,
+            "lifecycle_state": lifecycle_state(result["meta"]),
+            **report_summary(result["report"]), "checklist": reporting.checklist(result["report"].checks)}
 
 
 def _export_basename(master: dict, workflow: dict, kind: str, version_id: str, ws: Workspace) -> str:
@@ -215,6 +315,7 @@ def _export_basename(master: dict, workflow: dict, kind: str, version_id: str, w
 
 
 def release_resume(version_id: str, workflow_id: str, ws: Workspace | None = None) -> dict:
+    from lib import reporting
     ws = ws or get_workspace()
     workflows.check_workflow_id(workflow_id)
     with workspace_lock(ws):
@@ -222,7 +323,9 @@ def release_resume(version_id: str, workflow_id: str, ws: Workspace | None = Non
         if (current.get("metadata") or {}).get("released"):
             meta = current["metadata"]
             return {"ok": True, "released": True, "already_released": True, "version_id": version_id,
-                    "release_report_id": meta.get("release_report_id"), "export_basename": meta.get("export_basename")}
+                    "release_report_id": meta.get("release_report_id"), "export_basename": meta.get("export_basename"),
+                    "lifecycle_state": lifecycle_state(meta),
+                    "completion": reporting.completion_summary(version_id, workflow_id, ws=ws)}
 
         result = validate(version_id, workflow_id, ws)
         report: ValidationReport = result["report"]
@@ -247,9 +350,11 @@ def release_resume(version_id: str, workflow_id: str, ws: Workspace | None = Non
 
         if not released:
             return {"ok": True, "released": False, "version_id": version_id, "release_report_id": release_id,
-                    "status": "blocked", **report_summary(report),
+                    "status": "blocked", "lifecycle_state": lifecycle_state(meta), **report_summary(report),
                     "next_step": "Fix the critical failures (repairs may only drop/reorder blocks, via "
-                                 "tailor_resume(repair_of=...)), or choose a supported template. Max 3 repairs."}
+                                 "tailor_resume(repair_of=...)), or choose a supported template. Max 3 repairs.",
+                    "completion": reporting.completion_summary(version_id, workflow_id, ws=ws,
+                                                                release_report=rel.model_dump(mode="json"))}
 
         info = result["compile_info"]
         for ext in ("pdf", "tex"):
@@ -260,8 +365,11 @@ def release_resume(version_id: str, workflow_id: str, ws: Workspace | None = Non
                                                      "released_at": rel.created_at,
                                                      "export_basename": export_basename}, ws)
         workflows.update_workflow(workflow_id, ws=ws, set_fields={"status": "released"})
+        released_rel = rel.model_dump(mode="json")
+        released_rel["export_basename"] = export_basename
     return {"ok": True, "released": True, "version_id": version_id, "release_report_id": release_id,
-            "export_basename": export_basename, **report_summary(report)}
+            "export_basename": export_basename, "lifecycle_state": "released", **report_summary(report),
+            "completion": reporting.completion_summary(version_id, workflow_id, ws=ws, release_report=released_rel)}
 
 
 def load_release_report(version_id: str, release_id: str, ws: Workspace) -> dict:
@@ -304,7 +412,11 @@ def export(version: str, workflow_id: str | None, fmt: str = "pdf", mode: str = 
         rel = load_release_report(version_id, meta["release_report_id"], ws)
         base = meta["export_basename"]
         pdf_path, tex_path = ws.exports_dir / f"{base}.pdf", ws.exports_dir / f"{base}.tex"
-        pdf_bytes, tex = pdf_path.read_bytes(), tex_path.read_text(encoding="utf-8")
+        try:
+            pdf_bytes, tex = pdf_path.read_bytes(), tex_path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise ResumeTailorError("NOT_RELEASED", f"Version {version!r} was released but its exported file(s) "
+                                    "are missing from disk; re-release a new version.") from e
         if sha256_bytes(pdf_bytes) != rel["pdf_sha256"] or sha256_text(tex) != rel["tex_sha256"]:
             raise ResumeTailorError("NOT_RELEASED", "Released files were modified after release; re-release a new version.")
         label, stem = f"RELEASED ({meta['release_report_id']})", base

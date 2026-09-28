@@ -322,3 +322,114 @@ def test_ambiguous_table_shape():
     for term, rule in AMBIGUOUS_TERMS.items():
         assert rule["forms"], term
         assert term in KNOWN_SKILLS or term in ALIASES
+
+
+# --------------------------------------------------------------------------
+# Phase 3.1: stack-listed terms are weak, not missing (defect fix)
+# --------------------------------------------------------------------------
+
+def test_stack_only_term_is_weak_not_missing():
+    resume = {"summary": "", "skills": [], "experience": [],
+             "projects": [{"name": "p", "stack": "Kubernetes", "bullets": []}]}
+    r = match_resume_to_jd(resume, "Requirements: Kubernetes")
+    assert r["weak"] == ["kubernetes"]
+    assert r["missing"] == []
+
+
+def test_stack_term_used_in_a_bullet_is_matched_not_weak():
+    resume = {"summary": "", "skills": [], "experience": [],
+             "projects": [{"name": "p", "stack": "Kubernetes",
+                          "bullets": [{"text": "Deployed the service on Kubernetes."}]}]}
+    r = match_resume_to_jd(resume, "Requirements: Kubernetes")
+    assert r["matched"] == ["kubernetes"]
+
+
+# --------------------------------------------------------------------------
+# classify_term / requirement_view (Phase 3.1)
+# --------------------------------------------------------------------------
+
+def test_classify_term_supported_weak_missing():
+    from lib.matching import classify_term
+    resume = {"summary": "Built things with Python.",
+             "skills": [{"category": "x", "items": [{"name": "AWS"}]}],
+             "experience": [], "projects": []}
+    assert classify_term("python", resume) == "supported"
+    assert classify_term("aws", resume) == "weak"
+    assert classify_term("kubernetes", resume) == "missing"
+
+
+def test_requirement_view_covers_every_axis_once():
+    from lib.matching import requirement_view
+    resume = {"summary": "Built things with Python.",
+             "skills": [{"category": "x", "items": [{"name": "AWS"}]}],
+             "experience": [], "projects": [{"name": "p", "stack": "LangChain", "bullets": []}]}
+    result = match_resume_to_jd(resume, "Requirements: Python, AWS, Kubernetes, LangChain")
+    rows = requirement_view(result, resume)
+    by_term = {r["term"].lower(): r for r in rows}
+    assert by_term["python"]["status"] == "supported"
+    assert by_term["aws"]["status"] == "weak"
+    assert by_term["kubernetes"]["status"] == "missing"
+    assert by_term["langchain"]["status"] == "weak"  # reclassified via classify_term, not "unknown"
+    assert by_term["langchain"]["importance"] == "unrecognized"
+    assert len(rows) == len(set(r["term"].lower() for r in rows))  # no duplicates
+
+
+def test_requirement_view_unknown_term_not_in_master_stays_unknown():
+    from lib.matching import requirement_view
+    resume = {"summary": "", "skills": [], "experience": [], "projects": []}
+    # "ZorbaFlux" is CamelCase, so find_unknown_requirements flags it; a
+    # plain lowercase word like "zorbaflux" would not be technical-looking
+    # and would never reach the unknown_requirements axis at all
+    result = match_resume_to_jd(resume, "Requirements: ZorbaFlux")
+    assert "ZorbaFlux" in result["unknown_requirements"]
+    rows = requirement_view(result, resume)
+    zf = next(r for r in rows if r["term"] == "ZorbaFlux")
+    assert zf["status"] == "unknown"
+
+
+def test_requirement_view_priority_ordering():
+    from lib.matching import requirement_view
+    resume = {"summary": "", "skills": [], "experience": [], "projects": []}
+    jd = "Requirements: Python\nNice to have: Rust"
+    result = match_resume_to_jd(resume, jd)
+    rows = requirement_view(result, resume)
+    importances = [r["importance"] for r in rows]
+    # must_have rows must all come before nice_to_have rows
+    if "must_have" in importances and "nice_to_have" in importances:
+        assert importances.index("must_have") < importances.index("nice_to_have") or \
+              importances.count("must_have") == len(importances)
+
+
+# --------------------------------------------------------------------------
+# term_type / certification_requirements (Phase 3.2 foundation)
+# --------------------------------------------------------------------------
+
+def test_term_type_covers_every_known_skill():
+    from lib.keywords import KNOWN_SKILLS, TERM_TYPES, REQUIREMENT_TYPES
+    assert set(KNOWN_SKILLS) == set(TERM_TYPES)
+    assert set(TERM_TYPES.values()) <= set(REQUIREMENT_TYPES)
+
+
+def test_term_type_unknown_term_gets_default():
+    from lib.keywords import term_type, DEFAULT_TERM_TYPE
+    assert term_type("SomeRandomThing") == DEFAULT_TERM_TYPE
+
+
+def test_certification_requirements_line_scoped():
+    from lib.keywords import certification_requirements
+    jd = ("Requirements:\n"
+         "- AWS Certified Solutions Architect required\n"
+         "- Strong Python skills\n"
+         "Nice to have: Kubernetes\n")
+    assert certification_requirements(jd) == ["aws"]
+
+
+def test_certification_requirements_empty_when_no_cert_line():
+    from lib.keywords import certification_requirements
+    assert certification_requirements("Requirements: Python, AWS") == []
+
+
+def test_certification_requirements_empty_text():
+    from lib.keywords import certification_requirements
+    assert certification_requirements("") == []
+    assert certification_requirements(None) == []

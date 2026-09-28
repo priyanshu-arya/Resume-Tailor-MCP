@@ -118,6 +118,81 @@ SENIORITY_TERMS = [
     "principal", "lead", "manager", "director", "vp", "head of", "chief",
 ]
 
+# Requirement-type classification for KNOWN_SKILLS -- transcription of the
+# grouping already visible in that list's own comments/layout, not a new
+# classifier. Used only to make an evidence prompt's `requirement_type`
+# machine-readable; never a matching or provenance decision.
+REQUIREMENT_TYPES = ("language", "framework", "platform", "datastore", "data_tool",
+                     "practice", "domain", "tool", "certification", "technology")
+DEFAULT_TERM_TYPE = "technology"
+
+TERM_TYPES: dict[str, str] = {
+    # languages
+    "python": "language", "java": "language", "javascript": "language", "typescript": "language",
+    "c++": "language", "c#": "language", "go": "language", "rust": "language", "ruby": "language",
+    "php": "language", "scala": "language", "kotlin": "language", "swift": "language", "r": "language",
+    "html": "language", "css": "language", "sass": "language", "bash": "language",
+    "shell scripting": "language",
+    # query / data languages
+    "sql": "datastore", "nosql": "datastore",
+    # frameworks
+    "react": "framework", "angular": "framework", "vue": "framework", "next.js": "framework",
+    "node.js": "framework", "django": "framework", "flask": "framework", "fastapi": "framework",
+    "spring": "framework", "spring boot": "framework", ".net": "framework", "graphql": "framework",
+    "rest": "framework", "grpc": "framework", "tailwind": "framework",
+    # platforms (cloud / infra / CI)
+    "aws": "platform", "azure": "platform", "gcp": "platform", "kubernetes": "platform",
+    "docker": "platform", "terraform": "platform", "ansible": "platform", "jenkins": "platform",
+    "ci/cd": "platform", "github actions": "platform", "gitlab ci": "platform", "linux": "platform",
+    # datastores
+    "postgresql": "datastore", "mysql": "datastore", "mongodb": "datastore", "redis": "datastore",
+    "elasticsearch": "datastore", "kafka": "datastore", "rabbitmq": "datastore",
+    # data / ML tooling
+    "spark": "data_tool", "hadoop": "data_tool", "airflow": "data_tool", "snowflake": "data_tool",
+    "databricks": "data_tool", "tableau": "data_tool", "power bi": "data_tool", "looker": "data_tool",
+    "excel": "data_tool", "machine learning": "data_tool", "deep learning": "data_tool",
+    "nlp": "data_tool", "computer vision": "data_tool", "pytorch": "data_tool",
+    "tensorflow": "data_tool", "scikit-learn": "data_tool", "pandas": "data_tool", "numpy": "data_tool",
+    # practices
+    "agile": "practice", "scrum": "practice", "kanban": "practice", "microservices": "practice",
+    "api design": "practice", "system design": "practice", "distributed systems": "practice",
+    "unit testing": "practice", "test automation": "practice",
+    # domains
+    "product management": "domain", "project management": "domain", "leadership": "domain",
+    "stakeholder management": "domain", "cross-functional": "domain",
+    # tools
+    "jira": "tool", "confluence": "tool", "figma": "tool", "sketch": "tool", "adobe xd": "tool",
+    "selenium": "tool", "cypress": "tool", "pytest": "tool", "webpack": "tool", "vite": "tool",
+    "git": "tool", "github": "tool", "gitlab": "tool", "salesforce": "tool", "hubspot": "tool",
+    "sap": "tool", "erp": "tool", "crm": "tool",
+}
+
+
+def term_type(term: str) -> str:
+    """The requirement-type category for `term` -- TERM_TYPES.get(canonical
+    name, DEFAULT_TERM_TYPE). Case/alias-insensitive via normalize_term."""
+    return TERM_TYPES.get(normalize_term(term), DEFAULT_TERM_TYPE)
+
+
+_CERT_RE = re.compile(r"certif(?:ied|ication|icate)s?", re.IGNORECASE)
+
+
+def certification_requirements(jd_text: str) -> list[str]:
+    """Canonical KNOWN_SKILLS terms appearing on a line that also demands a
+    certification (e.g. "AWS Certified Solutions Architect required"),
+    line-scoped so a certification mention elsewhere in the JD can't leak
+    onto an unrelated term. Empty when no such line exists. Deterministic:
+    KNOWN_SKILLS order (not text order -- detect_terms returns a set)."""
+    if not jd_text:
+        return []
+    hit_lines = [line for line in jd_text.splitlines() if _CERT_RE.search(line)]
+    if not hit_lines:
+        return []
+    found: set[str] = set()
+    for line in hit_lines:
+        found |= detect_terms(line)
+    return [s for s in KNOWN_SKILLS if s in found]
+
 REQUIRED_SECTION_HEADERS = re.compile(
     r"(required|requirements|must have|minimum qualifications|what you.?ll need)",
     re.IGNORECASE,

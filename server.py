@@ -83,28 +83,62 @@ def _success_events(name: str, args: dict, result) -> list[tuple[str, dict]]:
     wf = args.get("workflow_id") or result.get("workflow_id")
     if name == "initialize_workspace" and result.get("created"):
         return [("workspace_initialized", {})]
+    if name == "select_workspace":
+        if result.get("switched"):
+            return [("workspace_switched", {"from_workspace_id": result.get("previous_workspace_id"),
+                                            "to_workspace_id": result.get("workspace_id")})]
+        return [("workspace_selected", {})]
+    if name == "discover_masters":
+        return [("master_discovered", {"candidate_count": result.get("candidate_count"),
+                                       "entries_examined": result.get("entries_examined")})]
+    if name == "import_master_from_folder":
+        events = [("master_updated", {"kind": args.get("kind"), "applied": bool(result.get("applied")),
+                                      "master_hash": result.get("master_hash")})]
+        if result.get("applied"):
+            events.append(("master_imported", {
+                "kind": args.get("kind"), "applied": True, "master_hash": result.get("master_hash"),
+                "source_hash": (result.get("import_provenance") or {}).get("source_hash")}))
+        return events
     if name == "migrate_legacy_data":
         statuses = [m.get("status") for m in (result.get("masters") or {}).values()]
         return [("legacy_migrated", {"migrated_count": sum(s in ("migrated", "replaced") for s in statuses),
                                      "conflict_count": statuses.count("conflict")})]
     if name == "set_master_resume":
-        return [("master_updated", {"kind": args.get("kind"), "applied": bool(result.get("applied")),
-                                    "master_hash": result.get("master_hash")})]
+        events = [("master_updated", {"kind": args.get("kind"), "applied": bool(result.get("applied")),
+                                      "master_hash": result.get("master_hash")})]
+        if result.get("applied"):
+            events.append(("master_created", {"kind": args.get("kind"), "applied": True,
+                                              "master_hash": result.get("master_hash")}))
+        return events
+    if name == "get_master_resume":
+        return [("master_loaded", {"kind": args.get("kind")})]
     if name == "analyze_tailoring_requirements":
         events = [] if args.get("workflow_id") else [("workflow_started", {"workflow_id": wf,
                                                                            "kind": args.get("source_kind")})]
+        status_counts = result.get("status_counts") or {}
         return events + [("requirements_analyzed", {
             "workflow_id": wf, "evidence_prompt_count": len(result.get("evidence_prompts") or []),
             "missing_count": len(result.get("missing") or []),
-            "unknown_count": len(result.get("unknown_requirements") or [])})]
+            "unknown_count": len(result.get("unknown_requirements") or []),
+            "weak_count": status_counts.get("weak"), "supported_count": status_counts.get("supported")})]
     if name == "save_tailoring_evidence":
-        return [("evidence_saved", {"workflow_id": wf, "evidence_id": (result.get("evidence") or {}).get("id")})]
+        ev = result.get("evidence") or {}
+        return [("evidence_saved", {"workflow_id": wf, "evidence_id": ev.get("id"),
+                                    "evidence_category": ev.get("category"),
+                                    "prompt_reason": ev.get("prompt_reason")})]
     if name == "tailor_resume":
-        return [("tailor_succeeded", {"workflow_id": wf, "version_id": result.get("version_id"),
-                                      "patch_count": len(args.get("patches") or []),
-                                      "repair_attempt": 1 if args.get("repair_of") else 0,
-                                      "template_id": result.get("template_id"),
-                                      "source_master_hash": result.get("source_master_hash")})]
+        new_entry_count = len(result.get("new_entry_ids") or [])
+        events = [("tailor_succeeded", {"workflow_id": wf, "version_id": result.get("version_id"),
+                                        "patch_count": len(args.get("patches") or []),
+                                        "repair_attempt": result.get("repair_attempt", 0),
+                                        "template_id": result.get("template_id"),
+                                        "source_master_hash": result.get("source_master_hash"),
+                                        "new_entry_count": new_entry_count,
+                                        "rules_version": result.get("rules_version")})]
+        if new_entry_count:
+            events.append(("project_entry_added", {"workflow_id": wf, "version_id": result.get("version_id"),
+                                                    "new_entry_count": new_entry_count}))
+        return events
     if name == "validate_version":
         return [("validation_completed", {"workflow_id": wf, "version_id": args.get("version_id"),
                                           **_validation_fields(result)})]
@@ -151,6 +185,9 @@ def _safe_tool(fn):
             if name == "tailor_resume" and e.code in ("PATCH_INVALID", "PROVENANCE_VIOLATION"):
                 _audit("error", "tailor_rejected", **fields, rejection_count=len(rejections),
                        rule_ids=[r.get("rule") for r in rejections if r.get("rule")][:20])
+            elif (name in ("set_master_resume", "import_master_from_folder")
+                  and e.code in ("MASTER_CONFLICT", "CONFIRMATION_REQUIRED", "MASTER_EXISTS")):
+                _audit("error", "master_conflict", **fields)
             else:
                 _audit("error", "tool_error", **fields)
             return e.to_result()
@@ -288,22 +325,137 @@ def resource_etiquette() -> str:
 
 @mcp.tool()
 @_safe_tool
-def initialize_workspace() -> dict:
+def initialize_workspace(create_new: bool = False, label: str | None = None) -> dict:
     """Create the local Resume Tailor workspace on first run (under
-    $RESUME_TAILOR_HOME, default ~/.resume-tailor). Idempotent: returns the
-    existing workspace if one is configured. Writes no personal data -- it
-    reports where the master Resume/CV belong. If you have masters from the
-    old repo layout (resources/master_*.yaml), run migrate_legacy_data next."""
-    return {"ok": True, **_workspace.initialize_workspace()}
+    $RESUME_TAILOR_HOME, default ~/.resume-tailor). Idempotent by default:
+    returns the existing workspace if one is configured. Writes no personal
+    data -- it reports where the master Resume/CV belong. If you have
+    masters from the old repo layout (resources/master_*.yaml), run
+    migrate_legacy_data next.
+
+    Call get_workspace_status FIRST, not this tool -- if workspace(s) already
+    exist on this machine but none is bound, this raises WORKSPACE_AMBIGUOUS
+    rather than silently creating a new one and orphaning the existing
+    data. Pass create_new=True ONLY when the user explicitly asks for an
+    additional, separate workspace; never as a way to "fix" a broken or
+    ambiguous binding -- use select_workspace for that instead."""
+    return {"ok": True, **_workspace.initialize_workspace(create_new=create_new, label=label)}
 
 
 @mcp.tool()
 @_safe_tool
 def get_workspace() -> dict:
     """Show the active workspace: ID, root, master paths and which masters
-    exist. Errors with WORKSPACE_NOT_INITIALIZED if there is none yet --
-    never picks or creates one silently."""
+    exist. Errors with WORKSPACE_NOT_INITIALIZED if there is none yet, or
+    WORKSPACE_AMBIGUOUS if several exist and none is bound -- never picks or
+    creates one silently. Prefer get_workspace_status, which reports these
+    states instead of raising, so you can ask the user what to do next."""
     return {"ok": True, **_workspace.describe_workspace()}
+
+
+@mcp.tool()
+@_safe_tool
+def get_workspace_status() -> dict:
+    """CALL THIS FIRST in any session that touches the user's resume. Reports
+    whether this machine has a Resume Tailor workspace bound, and whether it
+    holds a usable master -- without creating, selecting or guessing
+    anything. Never raises for a missing or ambiguous binding.
+
+    state:
+      NO_WORKSPACE          - nothing on this machine yet. Ask the user for
+                              the path of ONE folder containing their
+                              existing resume/CV, then call
+                              discover_masters(folder). If they have no
+                              file, run the create-master-file skill. Do not
+                              reconstruct their resume from memory, this
+                              conversation, or any other workspace.
+      WORKSPACE_FOUND       - bound and usable; see masters[kind].ready.
+      WORKSPACE_NEEDS_SETUP - bound, but no valid/ready master yet. Import
+                              one or create one.
+      WORKSPACE_INVALID     - the binding is broken or ambiguous. See
+                              available_workspace_ids, ASK the user which
+                              is theirs, then select_workspace. Never pick
+                              for them, and never call initialize_workspace
+                              to "fix" this."""
+    from lib import resolve
+    return {"ok": True, **resolve.resolve_workspace_state()}
+
+
+@mcp.tool()
+@_safe_tool
+def list_workspaces() -> dict:
+    """Every Resume Tailor workspace on this machine, and which one (if any)
+    is active. Reads no resume content -- only whether a master file exists
+    for each workspace. Changes nothing."""
+    return {"ok": True, **_workspace.list_workspaces()}
+
+
+@mcp.tool()
+@_safe_tool
+def select_workspace(workspace_id: str) -> dict:
+    """Bind the active workspace to an EXISTING one, by an ID the USER
+    explicitly named (from list_workspaces). Never call this to "find" the
+    user's data, never because a master is missing, and never based on
+    which workspace merely looks more complete -- ask, don't guess. Creates
+    nothing, copies nothing, deletes nothing. Both the workspace you switch
+    away from and the one you switch to record the change in their own
+    audit log. A workflow started before the switch will not be reachable
+    afterward -- start over in the new workspace if needed."""
+    return {"ok": True, **_workspace.select_workspace(workspace_id)}
+
+
+@mcp.tool()
+@_safe_tool
+def discover_masters(folder: str, kind: str | None = None) -> dict:
+    """Look for importable resume/CV files in EXACTLY ONE folder the user
+    named. One level deep: no recursion, no other folder, no search of the
+    machine, and no fallback location if the folder is empty.
+
+    Returns ranked candidates with a resume-vs-CV guess and the reason for
+    it -- it NEVER selects one, even when there is exactly one candidate.
+    If more than one candidate comes back, show the user filename + kind
+    guess + reason for each and ask which ONE file and which kind to
+    import. Then call import_master_from_folder with that exact filename.
+    `kind` is only an optional hint that nudges ranking; it never hides a
+    candidate that doesn't match it."""
+    from lib import discovery
+    return {"ok": True, **discovery.discover_masters(folder, kind)}
+
+
+@mcp.tool()
+@_safe_tool
+def import_master_from_folder(folder: str, filename: str, kind: str, career_stage: str | None = None,
+                              accept_unparsed: bool = False, expected_hash: str | None = None,
+                              confirm: bool = False, proposed_hash: str | None = None) -> dict:
+    """Import ONE file the user chose from discover_masters's results as the
+    master `kind` ("resume" or "cv" -- two separate documents, never
+    merged). `folder`, `filename` and `kind` are all required: nothing here
+    is inferred or guessed.
+
+    The file is COPIED into the workspace; the folder is never a live
+    master and is never read again after this call. Provenance (source
+    filename, folder name/hash, file hash) is recorded on the master and
+    can be read back with get_master_history.
+
+    Replacing an existing master follows the same preview/confirm protocol
+    as set_master_resume: the first call writes nothing and returns a diff
+    plus current_hash/proposed_hash for the user to approve; call again
+    with confirm=True, expected_hash, proposed_hash to apply it."""
+    from lib import discovery
+    return discovery.import_master(
+        folder, filename, kind, career_stage=career_stage, accept_unparsed=accept_unparsed,
+        expected_hash=expected_hash, confirm=confirm, proposed_hash=proposed_hash)
+
+
+@mcp.tool()
+@_safe_tool
+def get_master_history(kind: str = "resume", limit: int = 20) -> dict:
+    """Write history of the master `kind`: when it changed, why, the hash
+    before and after, and -- for imports -- the source filename, folder
+    name/hash and file hash. Read-only; contains no resume content, so it
+    is safe to show the user verbatim."""
+    from lib import storage
+    return {"ok": True, "kind": kind, "history": storage.read_master_history(kind, limit)}
 
 
 @mcp.tool()
@@ -377,7 +529,8 @@ def analyze_tailoring_requirements(jd_text: str, source_kind: str = "resume", wo
 @mcp.tool()
 @_safe_tool
 def save_tailoring_evidence(workflow_id: str, term: str, category: str, evidence_text: str = "",
-                            confirmed: bool = False, metrics: list[str] | None = None) -> dict:
+                            confirmed: bool = False, metrics: list[str] | None = None,
+                            prompt_reason: str | None = None) -> dict:
     """STEP 2. Record what the user EXPLICITLY told you, in this workflow,
     about one missing JD term. Only call with confirmed=True when the user
     stated the fact themselves -- not from silence, memory, earlier chats,
@@ -392,7 +545,7 @@ def save_tailoring_evidence(workflow_id: str, term: str, category: str, evidence
     returned evidence IDs to tailor_resume."""
     from lib import evidence
     return evidence.save_evidence(workflow_id, term, category, evidence_text=evidence_text,
-                                  confirmed=confirmed, metrics=metrics)
+                                  confirmed=confirmed, metrics=metrics, prompt_reason=prompt_reason)
 
 
 @mcp.tool()
@@ -447,12 +600,20 @@ def tailor_resume(save_as: str, patches: list[dict], workflow_id: str, jd_text: 
       {"operation": "add_block", "parent_id": "proj-001", "new_content": {...}}   # new bullet
       {"operation": "add_skill_item", "category": "Frameworks", "name": "FastAPI",
        "source_refs": [{"type": "evidence", "id": "ev-..."}], "claim_strength": "personal_project"}
+      {"operation": "add_project_entry", "name": "...", "stack": "...", "academic": false,
+       "source_refs": [{"type": "evidence", "id": "ev-..."}], "claim_strength": "personal_project",
+       "bullets": [{"text": "...", "source_refs": [...]}]}   # a brand-new Projects entry (1-4 bullets)
 
     Every new/changed block needs source_refs to real master blocks or to
     evidence the user confirmed in THIS workflow (pass those IDs in
     evidence_ids). Titles, companies, dates, degrees and contact details
-    cannot be patched. repair_of=<version_id> re-applies that version's
-    patches plus drop_block/reorder-only repairs (max 3 per workflow).
+    cannot be patched. add_project_entry can only ever create a new Projects
+    entry -- there is no operation that adds a job, employer or role; needs
+    at least one evidence ref of category professional/internship/
+    personal_project/academic (never coursework/certification/learning_only,
+    and never a master ref alone). repair_of=<version_id> re-applies that
+    version's patches plus drop_block/reorder-only repairs (max 3 per
+    workflow).
     """
     from lib import tailoring
     return tailoring.tailor(save_as, patches, workflow_id=workflow_id, jd_text=jd_text,
@@ -584,10 +745,12 @@ def get_workflow_status(workflow_id: str | None = None) -> dict:
     if not workflow_id:
         return {"ok": True, "workflows": workflows.list_workflow_ids(), "metrics": metrics.rebuild_metrics()}
     wf = workflows.load_workflow(workflows.check_workflow_id(workflow_id))
+    from lib import release as _release
     versions = []
     for vid in wf.get("version_ids") or []:
         meta = (storage.load_version(vid) or {}).get("metadata") or {}
         versions.append({"version_id": vid, "released": bool(meta.get("released")),
+                         "lifecycle_state": _release.lifecycle_state(meta),
                          "release_report_id": meta.get("release_report_id"), "template_id": meta.get("template_id"),
                          "repair_of": meta.get("repair_of")})
     return {
@@ -606,9 +769,30 @@ def get_workflow_status(workflow_id: str | None = None) -> dict:
 
 @mcp.tool()
 @_safe_tool
+def system_diagnostics(workflow_id: str | None = None, limit: int = 200, errors_only: bool = False) -> dict:
+    """Read-only forensics over the audit log: a reconstructed timeline,
+    failure counts by category/code/check-id, reliability metrics and fixed
+    remediation hints. Unlike get_workflow_status, this never writes
+    metrics.json -- use it for a strictly read-only view. Recommendations
+    come only from a fixed table; nothing here retries, repairs or changes
+    rules/thresholds/templates on its own -- report the failure and the
+    recommended human action."""
+    from lib import diagnostics
+    return {"ok": True, **diagnostics.system_diagnostics(workflow_id, limit, errors_only)}
+
+
+@mcp.tool()
+@_safe_tool
 def list_versions() -> dict:
-    """List all saved resume versions (excluding the master)."""
-    return {"versions": storage.list_version_ids()}
+    """List all saved resume versions (excluding the master), each with its
+    derived lifecycle_state (draft/released) -- not a persisted "validated"
+    flag; a version is only ever draft or released."""
+    from lib import release as _release
+    versions = []
+    for vid in storage.list_version_ids():
+        meta = (storage.load_version(vid) or {}).get("metadata") or {}
+        versions.append({"version_id": vid, "lifecycle_state": _release.lifecycle_state(meta)})
+    return {"versions": versions}
 
 
 # --------------------------------------------------------------------------
@@ -624,12 +808,12 @@ def tailor_resume_workflow(jd_text: str, company: str = "", role: str = "", kind
 
 1. Read resume://etiquette (content rules, evidence placement matrix, verb scope) before writing anything.
 2. analyze_tailoring_requirements(jd_text, source_kind="{kind}") -> keep the workflow_id. Source of truth is ONLY the workspace master -- never Claude memory, earlier conversations, or previous tailored versions.
-3. For each evidence prompt, ask me in plain words whether and how I have used the term (professional, internship, personal project, academic, coursework, certification, learning only, or not at all). Do not answer for me or assume. Only after I explicitly answer, call save_tailoring_evidence(confirmed=True) with my own words (and any numbers I gave, quoted exactly). If I say I don't have it, save category "none".
+3. Ask me each evidence prompt ONE AT A TIME, in its `order` (ask_one_at_a_time is true for a reason -- batching invites one vague "yes" that isn't real confirmation for any single term), in plain words: whether and how I have used the term (professional, internship, personal project, academic, coursework, certification, learning only, or not at all). Do not answer for me or assume. Only after I explicitly answer, call save_tailoring_evidence(confirmed=True) with my own words (and any numbers I gave, quoted exactly). If I say I don't have it, save category "none" and say the returned `statement` back to me verbatim -- do not soften it or skip it.
 4. get_master_resume(kind="{kind}") -> use citable_blocks IDs.
 5. Propose structured patches (never a full resume) and call tailor_resume(save_as="{suggested_id}", patches=..., workflow_id=..., evidence_ids=[...]). Every new/changed block cites real source_refs. Reword for relevance and JD terminology only where the evidence supports it; never raise claim strength, add metrics, technologies or scope that the sources do not state. If the server rejects a patch, fix the patch -- do not work around the rule.
-6. validate_version, then release_resume. If release is blocked, repair only with drop_block/reorder patches via tailor_resume(repair_of=...) (max 3), or report that release is blocked. Never shrink fonts/margins or pick an unregistered layout.
+6. validate_version (returns a 7-group `checklist`: provenance, evidence, content, template, ats, latex, pdf), then release_resume. If release is blocked, repair only with drop_block/reorder patches via tailor_resume(repair_of=...) (max 3), or report that release is blocked. Never shrink fonts/margins or pick an unregistered layout.
 7. export_resume(version, workflow_id) and deliver BOTH the attached PDF and the LaTeX source in a ```latex block.
-8. Finish with: Source (workspace master {kind}); Template; Added after my confirmation (term - category - section - why useful); Not added (and why); what was optimized; validation results; Released: yes/no. Say plainly where each confirmed term was placed (e.g. "AWS was added to Projects because you confirmed your personal project ran on AWS EC2; it was not added to Experience").
+8. Both validate_version and release_resume return a `completion` block -- render `completion.display_order` as your finish message; do not recompute or add items, and do not reconstruct it from memory across turns. It covers: Source (workspace master {kind}); Template; Added after my confirmation (term - category - section - why); Not added (say each `statement` verbatim); what was optimized; the validation checklist; Released: yes/no. Say plainly where each confirmed term was placed (e.g. "AWS was added to Projects because you confirmed your personal project ran on AWS EC2; it was not added to Experience"). If an older server has no `completion` block, assemble the same 10 parts yourself from the individual tool results.
 
 Job description:
 ---

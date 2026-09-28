@@ -93,6 +93,25 @@ def _family_label(family: set[str]) -> str:
 
 
 # --------------------------------------------------------------------------
+# Scope-inflation phrases (verb swapped, inflation kept)
+# --------------------------------------------------------------------------
+
+def _marker_pattern(marker: str) -> re.Pattern:
+    # Phrase-tolerant: whitespace/hyphen runs between words match each other.
+    words = [w for w in re.split(r"[\s-]+", marker.strip()) if w]
+    body = r"[\s-]+".join(re.escape(w) for w in words)
+    return re.compile(rf"(?<![A-Za-z]){body}(?![A-Za-z])", re.IGNORECASE)
+
+
+def _compiled_markers() -> list[tuple[str, re.Pattern]]:
+    return [(m, _marker_pattern(m)) for m in rules.scope_inflation_markers()]
+
+
+def _markers_in(text: str, markers: list[tuple[str, re.Pattern]]) -> list[str]:
+    return [label for label, pattern in markers if pattern.search(text or "")]
+
+
+# --------------------------------------------------------------------------
 # The hook
 # --------------------------------------------------------------------------
 
@@ -243,6 +262,22 @@ def check(ctx: dict) -> list[dict]:
         if missing_verbs:
             problems.append(_rej("high_scope_verb",
                                  f"High-scope verb(s) not present in any cited source: {', '.join(missing_verbs)}."))
+
+    # 8. scope inflation: a scope-inflating phrase survives even with a safe
+    # verb (e.g. "Deployed enterprise-grade ... serving thousands of users
+    # across multiple regions") -- the same cited-in-source requirement as a
+    # high-scope verb, sourced from rules.scope_inflation_markers().
+    markers = _compiled_markers()
+    text_markers = _markers_in(text, markers)
+    if text_markers:
+        source_markers: set[str] = set()
+        for ref in refs:
+            source_markers.update(_markers_in(ref.get("text") or "", markers))
+        missing_markers = [mk for mk in text_markers if mk not in source_markers]
+        if missing_markers:
+            problems.append(_rej("scope_inflation",
+                                 f"Scope-inflating phrase(s) not present in any cited source: "
+                                 f"{', '.join(missing_markers)}."))
 
     return problems
 

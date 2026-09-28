@@ -15,8 +15,13 @@ CONTRACT = {"id": "classic-minimalist", "status": "supported", "version": "1.1.0
   "layout": {"columns": 1, "tables_allowed": False, "text_boxes_allowed": False, "graphics_allowed": False},
   "sections": {"order": ["summary", "experience", "projects", "skills", "education", "certifications"],
                "headings": {"summary": "Summary", "experience": "Experience", "projects": "Projects", "skills": "Technical Skills", "education": "Education", "certifications": "Certifications"}},
+  "spacing": {"section": "\\vspace{2pt} + titlerule", "bullet": "itemsep=2pt", "line_spacing": "single"},
   "limits": {"min_pages": 1, "max_pages": 2},
-  "latex": {"documentclass_options": ["letterpaper", "11pt"], "topmargin_adjust_in": -0.4, "textheight_adjust_in": 0.9, "side_margin_adjust_in": -0.4, "textwidth_adjust_in": 0.8}}
+  "formatting": {"bullet_style": "itemize", "date_style": "as written in master",
+                 "heading_style": "bold small caps + rule", "link_style": "hyperref hidelinks"},
+  "latex": {"documentclass_options": ["letterpaper", "11pt"],
+            "layout_only_macros": ["resumeSubheading", "resumeProjectHeading"],
+            "topmargin_adjust_in": -0.4, "textheight_adjust_in": 0.9, "side_margin_adjust_in": -0.4, "textwidth_adjust_in": 0.8}}
 
 SENTINEL = "ZQXSENTINEL"
 
@@ -102,6 +107,38 @@ def test_standard_headings_fail():
     contract["sections"]["headings"]["experience"] = "My Journey"
     c = _run(_version(), contract)["structure.standard_headings"]
     assert (c.status, c.severity) == ("fail", "error") and "experience" in c.message
+
+
+def test_section_order_fails_on_duplicate_entries():
+    contract = copy.deepcopy(CONTRACT)
+    contract["sections"]["order"] = ["summary", "experience", "experience", "projects", "skills", "education",
+                                     "certifications"]
+    c = _run(_version(), contract)["structure.section_order"]
+    assert c.status == "fail" and "duplicates" in c.message
+
+
+def test_section_order_fails_on_unknown_section_entry():
+    contract = copy.deepcopy(CONTRACT)
+    contract["sections"]["order"] = ["summary", "experience", "projects", "skills", "education",
+                                     "certifications", "hobbies"]
+    c = _run(_version(), contract)["structure.section_order"]
+    assert c.status == "fail" and "hobbies" in c.message
+
+
+def test_standard_headings_fails_for_missing_heading():
+    contract = copy.deepcopy(CONTRACT)
+    del contract["sections"]["headings"]["experience"]
+    c = _run(_version(), contract)["structure.standard_headings"]
+    assert (c.status, c.severity) == ("fail", "error")
+    assert "no heading for section(s): experience" in c.message
+
+
+def test_every_structure_check_id_is_emitted():
+    from lib.validators.structure import ALL_CHECK_IDS
+    v = _version()
+    index = index_blocks(_master())
+    checks = check_structure(v, CONTRACT, "resume", master_index=index, evidence={})
+    assert {c.id for c in checks} == set(ALL_CHECK_IDS)
 
 
 def test_unknown_contract_sections_not_available():

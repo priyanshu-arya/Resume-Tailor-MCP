@@ -7,18 +7,10 @@ import copy
 import pytest
 
 from lib import export
-from lib.errors import ResumeTailorError
 from lib.ids import normalize_master
 from lib.latex import render_latex
 from lib.validators.pdf import ALL_CHECK_IDS, BLOCKED_MESSAGE, check_pdf, detect_pdf_backend
-
-try:
-    export._tectonic_path()
-    _HAVE_TECTONIC = True
-except ResumeTailorError:
-    _HAVE_TECTONIC = False
-
-needs_tectonic = pytest.mark.skipif(not _HAVE_TECTONIC, reason="tectonic not available")
+from tests.conftest import needs_tectonic
 
 CONTRACT = {
     "id": "classic-minimalist", "status": "supported", "version": "1.1.0",
@@ -117,6 +109,36 @@ def test_max_pages_exceeded(build, doc):
     assert measured["page_count"] > 1
     pc = _by_id(checks)["pdf.page_count"]
     assert pc.status == "fail" and pc.severity == "critical" and pc.blocking
+
+
+@needs_tectonic
+def test_helvet_real_embedded_wrong_family_fails(build, base_tex, doc):
+    """Tier B: a real embedded wrong-family font, only real TeX can produce
+    faithfully -- tectonic's default XeTeX/TU encoding needs an explicit T1
+    fontenc for classic PSNFSS font packages like helvet to actually
+    resolve; without it the font shape is silently substituted back to the
+    default and nothing changes. Distinct from Tier A's hand-built
+    *non-embedded* base-14 font, which exercises a different branch
+    entirely (no font program at all, vs. a real but wrong one)."""
+    t = base_tex.replace(r"\usepackage{latexsym}",
+                         "\\usepackage[T1]{fontenc}\n\\usepackage{latexsym}\n\\usepackage{helvet}", 1)
+    t = t.replace(r"\begin{document}", "\\renewcommand{\\familydefault}{\\sfdefault}\n\\begin{document}", 1)
+    info = build("helvet", t)
+    checks, measured, _ = check_pdf(info["pdf_path"], CONTRACT, doc, max_pages=2, compile_info=info)
+    c = _by_id(checks)["pdf.fonts"]
+    assert c.status == "fail"
+    assert any("NimbusSan" in f for f in measured["fonts"])
+
+
+@needs_tectonic
+def test_trailing_blank_page_fails_empty_pages(build, base_tex, doc):
+    t = base_tex.replace(r"\end{document}", "\\clearpage\\mbox{}\\clearpage\n\\end{document}", 1)
+    info = build("trailing-blank", t)
+    checks, measured, _ = check_pdf(info["pdf_path"], CONTRACT, doc, max_pages=3, compile_info=info)
+    assert measured["page_count"] >= 2
+    c = _by_id(checks)["pdf.empty_pages"]
+    assert c.status == "fail"
+    assert measured["page_count"] in c.measurement
 
 
 @needs_tectonic

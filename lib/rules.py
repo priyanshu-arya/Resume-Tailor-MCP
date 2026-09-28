@@ -86,3 +86,11 @@ def familiarity_markers() -> list[str]:
 
 def evidence_categories() -> list[str]:
     return [str(c) for c in (_load().get("evidence_categories") or [])]
+
+
+def skill_group_categories() -> list[str]:
+    return [str(c) for c in (_load().get("skill_group_categories") or [])]
+
+
+def scope_inflation_markers() -> list[str]:
+    return [str(m).strip().lower() for m in (_load().get("scope_inflation_markers") or []) if str(m).strip()]

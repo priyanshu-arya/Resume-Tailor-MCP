@@ -12,7 +12,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from lib.errors import ResumeTailorError
 
@@ -128,6 +128,10 @@ class Project(_Open):
     stack: str | None = None
     dates: str | None = None
     academic: bool = False
+    # Only set for a brand-new entry (add_project_entry); an existing master
+    # project entry has neither -- see lib/patches.py's AddProjectEntry.
+    source_refs: list[SourceRef] = Field(default_factory=list)
+    claim_strength: ClaimStrength | None = None
     bullets: list[Bullet] = Field(default_factory=list)
 
 
@@ -169,12 +173,26 @@ class MigrationInfo(BaseModel):
     legacy_path: str
 
 
+class ImportInfo(BaseModel):
+    """Where a master was imported from (R-USER-11). Deterministic by design:
+    no timestamp, because metadata is inside sha256_of(doc) and set_master's
+    preview/confirm protocol rebuilds the candidate -- a wall-clock field here
+    would make every confirm fail with CONFIRMATION_REQUIRED. The import
+    *time* is recorded in master/history.yaml instead (see storage.py)."""
+    source: Literal["user_folder"] = "user_folder"
+    source_filename: str            # basename only -- never a full path
+    source_folder_name: str         # basename of the folder only
+    source_folder_hash: str         # sha256 of the resolved absolute folder path
+    source_hash: str                # sha256 of the imported file's bytes
+
+
 class MasterMetadata(_Open):
     kind: Literal["resume", "cv"]
     schema_version: int = SCHEMA_VERSION
     career_stage: str | None = None  # fresher | 1-3 | 3-5 | 5-10 | manager | director | academic
     unparsed_accepted: bool = False
     migration: MigrationInfo | None = None
+    imported: ImportInfo | None = None
 
 
 class MasterDocument(ResumeBody):
@@ -220,6 +238,8 @@ class TailoringEvidence(BaseModel):
     confirmed: bool
     metrics: list[str] = Field(default_factory=list)
     created_at: str
+    term_display: str | None = None
+    prompt_reason: str | None = None
 
 
 # --------------------------------------------------------------------------
@@ -277,8 +297,21 @@ class AddSkillItem(_Strict):
     claim_strength: ClaimStrength | None = None
 
 
+class AddProjectEntry(_Strict):
+    """Create-only: no `target`, so it can never be replayed against an
+    existing entry. Never `github`, `dates` or `id` -- extra="forbid" makes
+    that a schema guarantee, not a convention (spec 3.5)."""
+    operation: Literal["add_project_entry"]
+    name: str
+    stack: str | None = None
+    academic: bool = False
+    source_refs: list[SourceRef] = Field(default_factory=list)
+    claim_strength: ClaimStrength | None = None
+    bullets: list[NewContent] = Field(min_length=1, max_length=4)
+
+
 Patch = Annotated[
-    Union[ReplaceBlock, DropBlock, Reorder, AddBlock, AddSkillItem],
+    Union[ReplaceBlock, DropBlock, Reorder, AddBlock, AddSkillItem, AddProjectEntry],
     Field(discriminator="operation"),
 ]
 
@@ -295,6 +328,37 @@ class TemplateStatus(str, Enum):
     unsupported = "unsupported"
 
 
+# Dotted contract paths a `supported` template's contract must fully specify
+# (every key present and not the literal "unknown"); an `experimental`
+# template may leave any of these "unknown" rather than guess.
+CONTRACT_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    "page": ("size", "width_pt", "height_pt", "orientation", "margins_in"),
+    "typography": ("font_family", "pdf_font_prefixes", "body", "name", "heading", "size_tolerance_pt"),
+    "layout": ("sections", "columns", "tables_allowed", "text_boxes_allowed", "graphics_allowed"),
+    "sections": ("order", "headings"),
+    "spacing": ("section", "bullet", "line_spacing"),
+    "limits": ("min_pages", "max_pages"),
+    "formatting": ("bullet_style", "date_style", "heading_style", "link_style"),
+    "latex": ("documentclass_options", "layout_only_macros"),
+}
+
+
+def contract_gaps(data: dict) -> list[str]:
+    """Dotted paths (e.g. "page.size") that are missing or the literal
+    "unknown" in a raw (pre-model) or dumped contract dict. Pure; used by the
+    registry validator, the release gate and the tests."""
+    gaps: list[str] = []
+    for block, keys in CONTRACT_REQUIREMENTS.items():
+        value = data.get(block, "unknown")
+        if not isinstance(value, dict):
+            gaps += [f"{block}.{k}" for k in keys]
+            continue
+        for k in keys:
+            if value.get(k, "unknown") == "unknown":
+                gaps.append(f"{block}.{k}")
+    return gaps
+
+
 class TemplateContract(_Open):
     id: str
     name: str
@@ -307,6 +371,16 @@ class TemplateContract(_Open):
     spacing: dict[str, Any] | str = "unknown"
     limits: dict[str, Any] | str = "unknown"
     formatting: dict[str, Any] | str = "unknown"
+    latex: dict[str, Any] | str = "unknown"
+
+    @model_validator(mode="after")
+    def _supported_has_no_gaps(self):
+        if self.status == TemplateStatus.supported:
+            gaps = contract_gaps(self.model_dump(mode="json"))
+            if gaps:
+                raise ValueError(
+                    f"template {self.id!r} is status=supported but its contract is incomplete: {gaps}")
+        return self
 
 
 # --------------------------------------------------------------------------
@@ -393,3 +467,4 @@ class WorkflowMetadata(_Open):
     repair_attempts: int = 0
     status: Literal["analyzing", "tailored", "validated", "released", "blocked"] = "analyzing"
     analysis: dict[str, Any] = Field(default_factory=dict)
+    source_master_hash: str | None = None

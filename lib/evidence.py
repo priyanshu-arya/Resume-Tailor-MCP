@@ -21,11 +21,11 @@ import re
 
 from pydantic import ValidationError
 
-from lib import storage
+from lib import rules, storage
 from lib.errors import ResumeTailorError
-from lib.keywords import extract_jd_keywords
+from lib.keywords import certification_requirements, extract_jd_keywords, normalize_term, term_type
 from lib.locking import atomic_write_yaml, workspace_lock
-from lib.matching import match_resume_to_jd
+from lib.matching import match_resume_to_jd, requirement_view
 from lib.schemas import EvidenceCategory, TailoringEvidence, validate_kind
 from lib.workflows import check_workflow_id, create_workflow, load_workflow, update_workflow
 from lib.workspace import Workspace, get_workspace, safe_child, utc_now_iso
@@ -38,6 +38,21 @@ MAX_METRIC_CHARS = 40
 MAX_EVIDENCE_PER_WORKFLOW = 99  # two-digit counter
 
 CATEGORIES: list[str] = [c.value for c in EvidenceCategory]
+
+# Machine-readable reason a term was prompted for, in priority order.
+PROMPT_REASONS = ("must_have_missing", "must_have_weak", "certification_required",
+                  "unrecognized_requirement")
+_REASON_PRIORITY = {r: i for i, r in enumerate(PROMPT_REASONS)}
+MAX_PROMPTS = 12
+MAX_UNKNOWN_PROMPTS = 5
+
+_PLACEMENT_SECTIONS = ("experience", "projects", "skills", "summary", "education")
+
+
+def _placement_by_category() -> dict[str, dict[str, str]]:
+    """Live table of category -> section -> placement, built from
+    `rules.placement` (never a duplicate of the YAML matrix)."""
+    return {cat: {sec: rules.placement(cat, sec) for sec in _PLACEMENT_SECTIONS} for cat in CATEGORIES}
 
 CATEGORY_PROMPT = (
     "How have you used it? Pick the one that fits best:\n"
@@ -122,14 +137,72 @@ def _question(term: str, status: str) -> str:
             f"and it will not be added.")
 
 
-def _prompt(term: str, status: str) -> dict:
+def _decline_phrasing(term: str) -> str:
+    """The exact sentence to say if the user declines this prompt --
+    server-generated so it can't soften into something vaguer (CLAUDE.md's
+    evidence-question rules)."""
+    return f"I will not add {term} because no evidence was provided."
+
+
+def _prompt(term: str, status: str, reason: str, importance: str) -> dict:
     return {
         "term": term,
         "status": status,
+        "reason": reason,
+        "requirement_type": term_type(term),
+        "importance": importance,
         "question": _question(term, status),
         "categories": list(CATEGORIES),
         "allowed_placement_hint": _WEAK_PLACEMENT_HINT if status == "weak" else _PLACEMENT_HINT,
+        "placement_by_category": _placement_by_category(),
+        "decline_phrasing": _decline_phrasing(term),
+        "not_added_phrasing": _decline_phrasing(term),
     }
+
+
+def _build_prompts(requirements: list[dict], jd_text: str) -> tuple[list[dict], bool]:
+    """Evidence prompts from `requirement_view` rows, machine-reasoned and
+    budgeted: must_have missing -> must_have weak -> certification_required ->
+    unrecognized (unknown-axis, capped at MAX_UNKNOWN_PROMPTS), then the whole
+    list capped at MAX_PROMPTS. Nice-to-have terms never get a prompt. Each
+    term is prompted at most once, using its highest-priority applicable
+    reason."""
+    cert_terms = {normalize_term(t) for t in certification_requirements(jd_text)}
+    candidates: list[tuple[str, dict]] = []
+    for row in requirements:
+        status, importance, term = row["status"], row["importance"], row["term"]
+        if importance == "must_have" and status == "missing":
+            reason = "must_have_missing"
+        elif importance == "must_have" and status == "weak":
+            reason = "must_have_weak"
+        elif normalize_term(term) in cert_terms and status in ("missing", "weak"):
+            reason = "certification_required"
+        elif status == "unknown":
+            reason = "unrecognized_requirement"
+        else:
+            continue
+        candidates.append((reason, row))
+
+    candidates.sort(key=lambda pair: _REASON_PRIORITY[pair[0]])
+
+    prompts: list[dict] = []
+    unknown_count = 0
+    truncated = False
+    for reason, row in candidates:
+        if reason == "unrecognized_requirement":
+            if unknown_count >= MAX_UNKNOWN_PROMPTS:
+                truncated = True
+                continue
+            unknown_count += 1
+        if len(prompts) >= MAX_PROMPTS:
+            truncated = True
+            break
+        prompts.append(_prompt(row["term"], row["status"], reason, row["importance"]))
+    total = len(prompts)
+    for i, p in enumerate(prompts, start=1):
+        p["order"] = i
+        p["total"] = total
+    return prompts, truncated
 
 
 # --------------------------------------------------------------------------
@@ -142,7 +215,8 @@ def analyze_requirements(jd_text: str, source_kind: str = "resume", workflow_id:
     questions for every unsupported must-have requirement."""
     ws = ws or get_workspace()
     validate_kind(source_kind)
-    master, _ = storage.require_master(source_kind, ws=ws)
+    from lib import resolve
+    master, master_hash_value = resolve.require_tailorable_master(source_kind, ws=ws)
 
     if not isinstance(jd_text, str) or not jd_text.strip():
         raise _invalid("jd_text must be a non-empty string.")
@@ -177,11 +251,16 @@ def analyze_requirements(jd_text: str, source_kind: str = "resume", workflow_id:
     priority_weak_terms = [t for t in must_have if t in weak_set]
     priority_missing = priority_missing_terms + priority_weak_terms
 
-    prompts = [_prompt(t, "missing") for t in priority_missing_terms]
-    prompts += [_prompt(t, "weak") for t in priority_weak_terms]
-    prompts += [_prompt(t, "unknown") for t in unknown if t not in set(priority_missing)]
+    requirements = requirement_view(result, master)
+    status_counts: dict[str, int] = {}
+    for row in requirements:
+        status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+
+    prompts, prompts_truncated = _build_prompts(requirements, jd_text)
 
     source = f"workspace master {source_kind}"
+    trimmed_requirements = [{"term": r["term"], "status": r["status"], "importance": r["importance"],
+                             "reason": r["reason"]} for r in requirements]
     analysis = {
         "source": source,
         "confirmed": matched,
@@ -189,12 +268,17 @@ def analyze_requirements(jd_text: str, source_kind: str = "resume", workflow_id:
         "missing": missing,
         "priority_missing": priority_missing,
         "unknown_requirements": unknown,
+        "requirements": trimmed_requirements,
         "evidence_prompts": [{"term": p["term"], "status": p["status"]} for p in prompts],
         "match_score": result.get("score"),
         "ats_visible_score": result.get("ats_visible_score"),
         "analyzed_at": utc_now_iso(),
     }
-    update_workflow(workflow_id, set_fields={"analysis": analysis}, ws=ws)
+    # Record which master this gap analysis was computed against, so a later
+    # tailor_resume call can detect a master change in between and refuse to
+    # use evidence prompts that were asked against a now-stale master.
+    update_workflow(workflow_id, set_fields={"analysis": analysis, "source_master_hash": master_hash_value},
+                    ws=ws)
 
     return {
         "ok": True,
@@ -205,7 +289,12 @@ def analyze_requirements(jd_text: str, source_kind: str = "resume", workflow_id:
         "missing": missing,
         "priority_missing": priority_missing,
         "unknown_requirements": unknown,
+        "requirements": requirements,
+        "status_counts": status_counts,
         "evidence_prompts": prompts,
+        "prompts_truncated": prompts_truncated,
+        "ask_one_at_a_time": True,
+        "prompt_count": len(prompts),
         "match_score": result.get("score"),
         "ats_visible_score": result.get("ats_visible_score"),
     }
@@ -240,11 +329,16 @@ def _clean_metrics(metrics, evidence_text: str) -> list[str]:
 
 def save_evidence(workflow_id: str, term: str, category: str, evidence_text: str = "",
                   confirmed: bool = False, metrics: list[str] | None = None,
+                  prompt_reason: str | None = None,
                   ws: Workspace | None = None) -> dict:
     """Save one fact the user explicitly stated about a JD requirement."""
     ws = ws or get_workspace()
     check_workflow_id(workflow_id)
     load_workflow(workflow_id, ws)
+
+    if prompt_reason is not None and prompt_reason not in PROMPT_REASONS:
+        raise _invalid("prompt_reason must be one of: " + ", ".join(PROMPT_REASONS) + ".",
+                       allowed=list(PROMPT_REASONS))
 
     if confirmed is not True:
         raise _invalid(
@@ -299,8 +393,11 @@ def save_evidence(workflow_id: str, term: str, category: str, evidence_text: str
                     and rec.get("category") == category_value
                     and _fold(str(rec.get("evidence_text", ""))) == folded_text):
                 update_workflow(workflow_id, append={"evidence_ids": [eid]}, ws=ws)
-                return {"ok": True, "evidence": rec,
-                        "note": f"Identical evidence already saved as {eid}; reusing it. " + note}
+                dup_result = {"ok": True, "evidence": rec,
+                             "note": f"Identical evidence already saved as {eid}; reusing it. " + note}
+                if category_value == "none":
+                    dup_result["statement"] = _decline_phrasing(term_display)
+                return dup_result
 
         pat = _id_re(workflow_id)
         highest = max((int(pat.fullmatch(e).group(1)) for e in existing_ids), default=0)
@@ -318,13 +415,17 @@ def save_evidence(workflow_id: str, term: str, category: str, evidence_text: str
             confirmed=True,
             metrics=clean_metrics,
             created_at=utc_now_iso(),
+            term_display=term_display,
+            prompt_reason=prompt_reason,
         )
         record = model.model_dump(mode="json")
-        record["term_display"] = term_display
         atomic_write_yaml(safe_child(folder, evidence_id, ".yaml"), record, exclusive=True)
         update_workflow(workflow_id, append={"evidence_ids": [evidence_id]}, ws=ws)
 
-    return {"ok": True, "evidence": record, "note": note}
+    result = {"ok": True, "evidence": record, "note": note}
+    if category_value == "none":
+        result["statement"] = _decline_phrasing(term_display)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -350,10 +451,8 @@ def _load_one(ws: Workspace, workflow_id: str, evidence_id) -> dict:
         raise _invalid(f"Evidence {evidence_id} is not user-confirmed and cannot be used.",
                        evidence_id=evidence_id)
 
-    term_display = data.get("term_display")
-    core = {k: v for k, v in data.items() if k != "term_display"}
     try:
-        model = TailoringEvidence.model_validate(core)
+        model = TailoringEvidence.model_validate(data)
     except ValidationError as e:
         raise _invalid(f"Evidence {evidence_id} failed validation.", evidence_id=evidence_id,
                        errors=[{"loc": list(err["loc"]), "msg": err["msg"]} for err in e.errors()[:5]]
@@ -366,8 +465,6 @@ def _load_one(ws: Workspace, workflow_id: str, evidence_id) -> dict:
         if _fold(m) not in folded_text:
             raise _invalid(f"Evidence {evidence_id} has a metric not stated in its text.",
                            evidence_id=evidence_id, metric_index=i)
-    if isinstance(term_display, str):
-        record["term_display"] = term_display
     return record
 
 

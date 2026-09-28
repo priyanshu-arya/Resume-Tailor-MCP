@@ -8,16 +8,13 @@
 from __future__ import annotations
 
 import json
-import shutil
-from pathlib import Path
 
 import pytest
 
 import server
 from lib import storage
+from tests.conftest import needs_tectonic
 
-REPO = Path(__file__).resolve().parent.parent
-HAS_TECTONIC = (REPO / "bin" / "tectonic").exists() or bool(shutil.which("tectonic"))
 JD = "Backend Engineer\nRequirements:\n- Python\n- FastAPI\n- AWS\nWe value a calm sentinel-jd-sentence culture.\n"
 EVIDENCE_TEXT = "Built REST APIs using FastAPI for my personal sentinel-evidence project."
 
@@ -41,7 +38,7 @@ def _flow(release: bool):
     return wf, out["version_id"]
 
 
-@pytest.mark.skipif(not HAS_TECTONIC, reason="tectonic not available")
+@needs_tectonic
 def test_workflow_events_recorded_with_workflow_id(master):
     ws, _, _ = master
     wf, vid = _flow(release=True)
@@ -57,7 +54,7 @@ def test_workflow_events_recorded_with_workflow_id(master):
         assert e["timestamp"].endswith("Z") and e["workspace_id"] == ws.id
 
 
-@pytest.mark.skipif(not HAS_TECTONIC, reason="tectonic not available")
+@needs_tectonic
 def test_logs_contain_no_pii_or_content(master):
     ws, doc, _ = master
     _flow(release=True)
@@ -97,7 +94,7 @@ def test_workflow_id_required_for_mutations(master, call):
     assert call()["error"]["code"] == "WORKFLOW_REQUIRED"
 
 
-@pytest.mark.skipif(not HAS_TECTONIC, reason="tectonic not available")
+@needs_tectonic
 def test_metrics_rebuild_from_audit_history(master):
     ws, _, _ = master
     wf, _ = _flow(release=True)

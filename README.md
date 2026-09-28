@@ -16,6 +16,7 @@ A local-first **Model Context Protocol (MCP)** server that tailors your resume o
 
 - [What It Does](#what-it-does)
 - [Architecture](#architecture)
+- [Workspaces and Identity](#workspaces-and-identity)
 - [Installation & Quick Start](#installation--quick-start)
 - [Client Integration](#client-integration)
 - [Workflow Guide](#workflow-guide)
@@ -31,7 +32,7 @@ A local-first **Model Context Protocol (MCP)** server that tailors your resume o
 
 ## What It Does
 
-1. **Workspace isolation**: masters and all personal data live in `~/.resume-tailor/` (or `$RESUME_TAILOR_HOME`), never in this repository. Two masters: `resume` and `cv`, kept separate.
+1. **Workspace isolation and identity**: masters and all personal data live in `~/.resume-tailor/` (or `$RESUME_TAILOR_HOME`), never in this repository. Two masters: `resume` and `cv`, kept separate. Identity comes only from the local `config.yaml` binding -- never from Claude memory, chat history, a previous tailored version, or another workspace (see [Workspaces and Identity](#workspaces-and-identity)).
 2. **Evidence-gated tailoring**: before rewriting any bullet, the server asks Claude to record what the candidate actually said about each required skill. Tailoring is only allowed with confirmed evidence; invented metrics, technologies, or scope expansions are rejected structurally.
 3. **Structured patches**: Claude sends `[{operation, target, new_content}]`; the server loads the master itself. Passing a full resume body is not accepted.
 4. **Provenance validation**: 8 rules checked on every patch (placement by evidence category, claim strength, unsupported tech/metrics/verbs, scope expansion, internship-as-professional). All-or-nothing: partial saves don't exist.
@@ -44,27 +45,42 @@ A local-first **Model Context Protocol (MCP)** server that tailors your resume o
 
 ## Architecture
 
+Personal data lives under one or more **workspaces**, each an isolation
+boundary for one person on one machine (never inferred from the Claude
+account -- see "Workspaces and identity" below):
+
 ```
-~/.resume-tailor/                     # Workspace root (RESUME_TAILOR_HOME)
-├── master/
-│   ├── resume.yaml                   # Canonical master resume
-│   ├── cv.yaml                       # Canonical master CV (separate)
-│   └── backups/                      # Timestamped backups on every save
-├── data/
-│   ├── versions/                     # Tailored versions (write-once)
-│   ├── exports/                      # Released PDFs + LaTeX source
-│   ├── evidence/                     # Per-workflow evidence records
-│   ├── tailoring_sessions/           # Workflow state
-│   └── releases/                     # Release reports (no resume content)
-└── monitoring/
-    ├── audit.jsonl                   # Event log (IDs/hashes/counts only)
-    ├── errors.jsonl                  # Error log
-    └── metrics.json                  # Rebuilt from audit.jsonl
+~/.resume-tailor/                     # App root (RESUME_TAILOR_HOME)
+├── config.yaml                       # active_workspace_id, schema_version, workspaces{}
+├── .config.lock
+└── workspaces/
+    └── RT-XXXXXXXX/                  # One workspace = one person on one machine
+        ├── .lock
+        ├── master/
+        │   ├── resume.yaml           # Canonical master resume
+        │   ├── cv.yaml               # Canonical master CV (separate)
+        │   ├── backups/              # Timestamped backups on every save
+        │   ├── legacy/               # Verbatim snapshots from migrate_legacy_data
+        │   └── history.yaml          # Every master write, incl. import provenance
+        ├── data/
+        │   ├── versions/             # Tailored versions (write-once)
+        │   ├── jd_history/           # Saved job descriptions
+        │   ├── exports/              # Released PDFs + LaTeX source
+        │   ├── evidence/             # Per-workflow evidence records
+        │   ├── tailoring_sessions/   # Workflow state
+        │   └── releases/             # Release reports (no resume content)
+        └── monitoring/
+            ├── audit.jsonl           # Event log (IDs/hashes/counts only)
+            ├── .audit.lock
+            ├── errors.jsonl          # Error log
+            └── metrics.json          # Rebuilt from audit.jsonl
 
 resume-tailor-mcp/                    # This repository
 ├── server.py                         # FastMCP entrypoint
 ├── lib/
 │   ├── workspace.py                  # Workspace management, path safety
+│   ├── resolve.py                    # Workspace/master state resolution (never raises)
+│   ├── discovery.py                  # Folder-based master discovery/import
 │   ├── locking.py                    # fcntl-based locking, atomic writes
 │   ├── storage.py                    # Workspace-backed load/save
 │   ├── schemas.py                    # Pydantic v2 models (single field vocab)
@@ -99,12 +115,53 @@ resume-tailor-mcp/                    # This repository
 | Module | What it enforces |
 | :--- | :--- |
 | `workspace.py` | Path safety (`safe_child` rejects `../`), workspace isolation |
+| `resolve.py` | Workspace/master state resolution -- never raises, never guesses |
+| `discovery.py` | One folder, one level, never auto-selects a candidate |
 | `locking.py` | Reentrant `fcntl.flock`, `MASTER_CONFLICT` on stale hash |
 | `patches.py` | Header fields not patchable; all-or-nothing rejection |
 | `validators/provenance.py` | 8 provenance rules; internship ≠ professional |
 | `templates.py` | `TEMPLATE_NO_RENDERER` for anything not `classic-minimalist` |
 | `release.py` | Release requires PDF backend, supported template, passing page cap |
 | `audit.py` | `ALLOWED_FIELDS` whitelist structurally prevents PII in logs |
+
+---
+
+## Workspaces and identity
+
+The server never infers who you are from Claude memory, earlier
+conversations, a previous tailored version, or another workspace. Identity
+comes only from the local binding in `config.yaml`, and the same Claude
+account on two different machines gets two unrelated workspaces -- the
+account is not the identity boundary, the workspace is.
+
+Call `get_workspace_status()` first, in any session. It never raises, and
+reports one of four states:
+
+- **`NO_WORKSPACE`** -- nothing on this machine yet. Point `discover_masters`
+  at the folder holding your resume/CV, or build one from scratch with the
+  `create-master-file` skill.
+- **`WORKSPACE_FOUND`** -- bound and has at least one usable master.
+- **`WORKSPACE_NEEDS_SETUP`** -- bound, but no valid master of the kind you
+  need yet.
+- **`WORKSPACE_INVALID`** -- the binding is missing, broken, or ambiguous
+  (several workspaces exist and none is active). `list_workspaces()` shows
+  what's on this machine; `select_workspace(id)` binds to one you name.
+  Nothing is ever picked automatically.
+
+**Folder-based discovery, not a live filesystem source.** `discover_masters(folder)`
+scans exactly the one folder you name, one level deep -- no recursion, no
+searching elsewhere on the machine. It ranks candidates with a resume-vs-CV
+guess and a reason for each, and never selects one itself, even when there
+is only one candidate. `import_master_from_folder(folder, filename, kind)`
+then copies that one named file into the workspace (the folder is never
+read again afterward) through the same preview/confirm protocol as
+`set_master_resume`, and records where it came from
+(`get_master_history(kind)` reads that provenance back -- filename, source
+folder name/hash, file hash, and when each write happened).
+
+A workspace with no valid master of the requested kind blocks tailoring
+outright (`MASTER_NOT_FOUND`); the server never substitutes memory,
+conversation history or another workspace's data.
 
 ---
 
@@ -244,8 +301,14 @@ get_workflow_status()             →  global metrics (workflow_count, release_c
 
 | Tool | Purpose |
 | :--- | :--- |
-| `initialize_workspace` | Create workspace at `~/.resume-tailor/` (idempotent) |
+| `initialize_workspace` | Create workspace at `~/.resume-tailor/` (idempotent; `create_new=True` for an explicit additional one) |
 | `get_workspace` | Return workspace ID and directory layout |
+| `get_workspace_status` | Report `NO_WORKSPACE`/`WORKSPACE_FOUND`/`WORKSPACE_NEEDS_SETUP`/`WORKSPACE_INVALID` -- never raises, never guesses |
+| `list_workspaces` | Every workspace on this machine and which is active |
+| `select_workspace` | Bind to an existing workspace the user named; logged on both sides |
+| `discover_masters` | Rank importable resume/CV files in one named folder, one level deep -- never selects one |
+| `import_master_from_folder` | Copy one named file in as the master, with import provenance recorded |
+| `get_master_history` | Read back a master's write history, including import provenance |
 | `migrate_legacy_data` | Copy legacy `resources/master_*.yaml` into workspace (non-destructive) |
 | `list_workspace_size` | Bytes and file counts per subdirectory |
 | `get_master_resume` | Return master doc + hash + citable block index |
@@ -289,10 +352,13 @@ get_workflow_status()             →  global metrics (workflow_count, release_c
 | ID | Status | Notes |
 | :--- | :--- | :--- |
 | `classic-minimalist` | **supported** | The only template with a LaTeX renderer. Letter, 11pt, Computer Modern. Single column. `max_pages: 2`. |
+| `full-stack-modern` | experimental | Metadata only; no renderer; cannot be released. |
+| `student-achievements` | experimental | Metadata only; no renderer; cannot be released. |
+| `generic-minimal` | experimental | Metadata only; no renderer; cannot be released. |
 | `metrics-driven` | experimental | Metadata only; no renderer; cannot be released. |
-| `executive-brief` | experimental | Metadata only; no renderer; cannot be released. |
-| `academic-research` | experimental | Metadata only; no renderer; cannot be released. |
-| `creative-tech` | experimental | Metadata only; no renderer; cannot be released. |
+| `awesome-cv-resume` | experimental | Metadata only; no renderer; cannot be released. |
+| `deedy-cv` | experimental | Metadata only; no renderer; cannot be released. |
+| `latexcv-two-column` | experimental | Metadata only; no renderer; cannot be released. |
 
 Requesting an experimental template in `tailor_resume` is accepted for saving (the template ID is recorded). `release_resume` will block with `template.releasable` as a critical failure. `export_resume` in draft mode returns `TEMPLATE_NO_RENDERER`. There is no silent fallback to `classic-minimalist`.
 
@@ -324,13 +390,16 @@ If neither pypdf nor pdfplumber is available, `detect_pdf_backend()` returns `av
 
 ## Known Limitations (v2)
 
-- **No new project/experience entries via patches.** `add_block` adds a bullet under an existing entry; adding a brand-new role or project requires editing the master and re-tailoring.
+- **New entries are Projects-only.** `add_project_entry` can create a brand-new Projects entry (needs at least one `professional`/`internship`/`personal_project`/`academic` evidence ref covering the entry, and 1-4 sourced bullets); there is still no operation that adds a job, employer, role or degree -- a new Experience/Education entry requires editing the master and re-tailoring.
+- **The evidence-placement matrix can't say "the project must itself be academic."** For an *existing* master project bullet, academic-only evidence can still back it even if the project isn't flagged `academic: true` (the table only knows section, not per-entry academic-ness). This is enforced only where the system makes the structural claim itself -- a brand-new entry via `add_project_entry` requires the `academic` flag whenever academic evidence backs it (`provenance.project_academic_context`). Retrofitting this onto every existing project bullet would be stricter than the shipped matrix, since academic work legitimately appears under a plain Projects heading.
+- **The metric pool is the union of every ref cited together, not per-ref.** A number from one cited source can back a claim framed around a different cited source's subject, as long as both are cited on the same patch (`test_metric_pool_shared_across_refs_is_a_known_looseness`). A currency sign may be dropped from new text (never added or changed) -- a deliberate asymmetry, not a bug.
 - **No deterministic truncation.** If a version is too long, repair it by dropping bullets (`drop_block`) or reordering sections -- the server will not automatically cut bullets (doing so could drop the metric or claim that makes a bullet true).
 - **Font check is by family name.** The validator checks that the PDF's embedded font names include the contract's family string (e.g. "Computer Modern"). It does not verify exact variant names.
 - **Unknown-requirement detection is heuristic.** JD terms that aren't in the known-skills vocabulary are flagged by pattern (CamelCase, ALLCAPS 2–6 letters, words with `.`/`+`/`#`) -- this catches most technologies but will have false positives and false negatives.
 - **Repair limit is 3 per workflow.** After 3 repair attempts, `tailor_resume(repair_of=...)` is blocked; start a new workflow.
-- **`classic-minimalist` only.** `max_pages: 2` applies to every career stage today; the 2–3 page director/VP cap in CLAUDE.md becomes enforceable when a supported template raises its `max_pages` limit.
+- **`classic-minimalist` only.** `max_pages: 2` applies to every career stage today; the 2–3 page director/VP cap in CLAUDE.md becomes enforceable when a supported template raises its `max_pages` limit. When the template cap is the one actually binding, `release.career_stage` reports a non-blocking `warning` rather than a silent `pass`, so a director/academic release doesn't look like its full career-stage cap applied.
 - **Substring `kw in blob` matching replaced by word-boundary regex.** Short ambiguous terms (`go`, `r`, `rest`, `c`) use case-sensitive or contextual matching; aliases (`k8s`→`kubernetes`, `js`→`javascript`, etc.) are normalized.
+- **Skill item IDs are content-derived, not counter-backed.** Every other block ID family (`exp-`, `proj-`, `edu-`, `skg-`, `cert-`) uses a persistent high-water-mark counter, so a deleted ID is never reissued. Skill items are the one exception: their ID is a slug of the skill's name (`skill-python`). Deleting and re-adding a skill with the same name reissues the same ID (harmless); **renaming** a skill changes its ID, so an older tailored version's `source_refs` citing the old ID will no longer resolve. This is intentional -- making skill IDs sequential would renumber every existing master and invalidate every existing version's refs -- not a bug to be fixed casually.
 
 ---
 

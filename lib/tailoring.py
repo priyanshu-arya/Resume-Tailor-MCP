@@ -102,6 +102,11 @@ def evidence_usage(body: dict, summary_refs: list[dict], evidence: dict[str, dic
     note(summary_refs, "summary", "sum-001")
     for section in ("experience", "projects", "education"):
         for entry in body.get(section) or []:
+            if section == "projects":
+                # An entry's own source_refs are only set for a brand-new
+                # entry (add_project_entry); an existing master project has
+                # none, so this is a no-op for it.
+                note(entry.get("source_refs"), section, entry.get("id"))
             for b in entry.get("bullets") or []:
                 note(b.get("source_refs"), section, b.get("id"))
     for group in body.get("skills") or []:
@@ -113,9 +118,21 @@ def evidence_usage(body: dict, summary_refs: list[dict], evidence: dict[str, dic
     not_added = [{"term": ev.get("term_display") or ev["term"], "reason": "you said you have no experience with it"}
                  for ev in evidence.values() if ev["category"] == "none"]
     declined = {ev["term"] for ev in evidence.values() if ev["category"] == "none"}
-    for term in (workflow.get("analysis") or {}).get("priority_missing", []):
-        if term not in used_terms and term not in declined:
-            not_added.append({"term": term, "reason": "no supporting evidence in the master or confirmed by you"})
+    analysis = workflow.get("analysis") or {}
+    requirements = analysis.get("requirements")
+    if requirements:
+        status_by_term = {r["term"]: r.get("status") for r in requirements}
+        for term in analysis.get("priority_missing", []):
+            if term in used_terms or term in declined:
+                continue
+            if status_by_term.get(term) == "weak":
+                not_added.append({"term": term, "reason": "already listed under Skills; no bullet added"})
+            else:
+                not_added.append({"term": term, "reason": "no supporting evidence in the master or confirmed by you"})
+    else:
+        for term in analysis.get("priority_missing", []):
+            if term not in used_terms and term not in declined:
+                not_added.append({"term": term, "reason": "no supporting evidence in the master or confirmed by you"})
     return {"added_terms": used, "not_added": not_added}
 
 
@@ -129,12 +146,18 @@ def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str 
         raise ResumeTailorError("INVALID_KIND", f"Workflow {workflow_id} was started for the master "
                                 f"{workflow['source_kind']}, not {source_kind}.")
 
-    master, master_hash = storage.require_master(source_kind, ws)
-    from lib.master_ops import master_readiness
-    readiness = master_readiness(master)
-    if not readiness["ready"]:
-        raise ResumeTailorError("MASTER_INVALID", "The master still has unparsed content. Place it, or "
-                                "have the user explicitly accept it, before tailoring.", details=readiness)
+    from lib import resolve
+    master, master_hash = resolve.require_tailorable_master(source_kind, ws)
+
+    recorded_hash = workflow.get("source_master_hash")
+    if recorded_hash and recorded_hash != master_hash:
+        raise ResumeTailorError(
+            "MASTER_CONFLICT",
+            "The master changed since this workflow's gap analysis was run. The evidence prompts "
+            "and priority_missing you saw may be stale. Re-run analyze_tailoring_requirements "
+            "against the current master before tailoring.",
+            details={"analyzed_master_hash": recorded_hash, "current_master_hash": master_hash},
+        )
 
     if jd_text is None and workflow.get("jd_id"):
         jd_text = (storage.load_jd(workflow["jd_id"], ws) or {}).get("jd_text")
@@ -198,13 +221,13 @@ def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str 
             "summary_source_refs": report["summary"]["source_refs"],
             "summary_claim_strength": report["summary"].get("claim_strength"),
         }
+        repair_attempt = workflow.get("repair_attempts", 0) + (1 if repair_of else 0)
         storage.save_version(version_id, doc, ws)
         atomic_write_yaml(_patches_path(ws, version_id), {"version_id": version_id, "workflow_id": workflow_id,
                                                           "evidence_ids": evidence_ids, "patches": all_patches})
         workflows.update_workflow(
             workflow_id, ws=ws, append={"version_ids": [version_id], "evidence_ids": evidence_ids},
-            set_fields={"status": "tailored",
-                        "repair_attempts": workflow.get("repair_attempts", 0) + (1 if repair_of else 0)},
+            set_fields={"status": "tailored", "repair_attempts": repair_attempt},
         )
 
     result = {
@@ -214,12 +237,16 @@ def tailor(save_as: str, patches: list[dict], *, workflow_id: str, jd_text: str 
         "source": f"workspace master {source_kind}",
         "source_master_hash": master_hash,
         "template_id": template_id,
+        "template_version": template_version,
+        "rules_version": _rules_version(),
         "released": False,
         "changed_block_ids": report.get("changed_block_ids", []),
         "new_block_ids": report.get("new_block_ids", []),
+        "new_entry_ids": report.get("new_entry_ids", []),
         "dropped_block_ids": report.get("dropped_block_ids", []),
         "added_terms": usage["added_terms"],
         "not_added": usage["not_added"],
+        "repair_attempt": repair_attempt,
         "next_step": "Call validate_version, then release_resume, then export_resume.",
     }
     if match:

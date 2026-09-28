@@ -1,6 +1,6 @@
 ---
 name: create-cv
-description: Build a brand-new CV/resume from scratch through a structured interview conversation, for someone who has no existing resume file to import. Use this whenever the user asks to "create my CV", "build my resume from scratch", "make me a resume/CV, I don't have one", or similar. Not for importing an existing file (use set_master_resume for that) and not for tailoring a saved master to a job (use tailor_resume_workflow for that). This skill gathers content; the create-master-file skill handles workspace setup and the final set_master_resume call.
+description: Build a brand-new CV/resume from scratch through a structured interview conversation, for someone who has no existing resume file to import. Use this whenever the user asks to "create my CV", "build my resume from scratch", "make me a resume/CV, I don't have one", or similar. Not for importing an existing file (use discover_masters/import_master_from_folder for that) and not for tailoring a saved master to a job (use tailor_resume_workflow for that). This skill gathers content; the create-master-file skill handles workspace setup and the final set_master_resume call.
 ---
 
 # Create CV From Scratch
@@ -10,9 +10,17 @@ complete, schema-correct master resume or CV, then hand off to the
 `create-master-file` skill for workspace setup and saving.
 
 This is the "blank slate" path. Two adjacent things this is **not**:
-- They have an existing file to import → use `set_master_resume` instead.
+- They have an existing file to import → `discover_masters`/
+  `import_master_from_folder` instead (see `create-master-file` step 3).
 - They already have a master saved and want it tailored → use the
   `tailor_resume_workflow` prompt instead.
+
+This skill is only reached after `get_workspace_status()` has been checked
+(step 0 below) and, for the existing-file path, after `discover_masters`
+found nothing or the user said outright they have no file. Its output is
+saved via `set_master_resume(resume=<dict>, ...)`, which the server logs as
+`master_created` -- distinct from the `master_imported` event an existing
+file produces.
 
 All formatting, bullet, summary, and ATS rules live in `resume://etiquette`
 (`resources/resume_etiquette.yaml`) -- read it once at the start and apply
@@ -22,7 +30,10 @@ it throughout. Don't restate its rules here; it's the single source of truth.
 
 Before gathering any content, invoke `create-master-file` steps 0–1 (or
 run them inline if you're already orchestrating both skills):
-- `initialize_workspace()` (idempotent).
+- `get_workspace_status()` first. `NO_WORKSPACE` -> ask if this is the
+  first time on this computer, then `initialize_workspace()`.
+  `WORKSPACE_INVALID` -> `list_workspaces()`/`select_workspace(id)`, never
+  `initialize_workspace()`. Otherwise continue.
 - Ask Resume or CV? (`kind = "resume"` or `"cv"`).
 - Check whether a master of that kind already exists via
   `get_master_resume(kind=kind)` and warn if so.

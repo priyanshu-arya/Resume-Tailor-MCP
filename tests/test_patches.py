@@ -114,6 +114,7 @@ def test_noop_equals_master_content_plus_self_refs(m):
         c["claim_strength"] = "certification"
     assert body == expected
     assert report == {"applied": [], "new_block_ids": [], "changed_block_ids": [], "dropped_block_ids": [],
+                      "new_entry_ids": [],
                       "summary": {"source_refs": [_mref("sum-001")], "claim_strength": None}}
 
 
@@ -245,9 +246,9 @@ def test_add_skill_to_existing_group_case_insensitive(m):
 
 def test_add_skill_creates_new_group(m):
     body, report = validate_and_apply(
-        m, [add_skill("Orchestration", "Kubernetes"), add_skill("orchestration", "Helm")], workflow_id=WF)
+        m, [add_skill("Tools", "Kubernetes"), add_skill("tools", "Helm")], workflow_id=WF)
     assert body["skills"][-1]["id"] == "vg-001"
-    assert body["skills"][-1]["category"] == "Orchestration"
+    assert body["skills"][-1]["category"] == "Tools"
     assert [i["id"] for i in body["skills"][-1]["items"]] == ["vs-001", "vs-002"]
     assert report["new_block_ids"] == ["vg-001", "vs-001", "vs-002"]
 
@@ -660,7 +661,7 @@ def test_hook_ctx_contents(m):
         add_block("proj-001", "Did Y.", refs=[_mref("proj-001-b01")], claim_strength="academic"),
         add_skill("languages", "Rust", refs=[_mref("skill-go")]),
         replace("sum-001", "Summary.", refs=[_mref("exp-002-b01")]),
-        add_skill("New Group", "Helm", refs=[_eref("ev-001")]),
+        add_skill("Tools", "Helm", refs=[_eref("ev-001")]),
     ]
     validate_and_apply(m, patches, workflow_id=WF, evidence=ev, provenance_hook=lambda c: seen.append(c) or [])
     assert [c["patch_index"] for c in seen] == [1, 2, 3, 4, 5]
@@ -684,7 +685,7 @@ def test_hook_ctx_contents(m):
     assert seen[2]["ref_infos"][0]["category"] == "master_skill"
     assert (seen[3]["target_type"], seen[3]["target_section"], seen[3]["claim_strength"]) == (
         "summary", "summary", "internship")
-    assert seen[4]["skill_group_category"] == "New Group"
+    assert seen[4]["skill_group_category"] == "Tools"
 
 
 def test_hook_not_called_when_structural_or_ref_checks_fail(m):
@@ -746,3 +747,93 @@ def test_rejection_details_never_quote_patch_text(m):
     assert len(_rejections(exc)) >= len(patches)
     assert SENTINEL not in str(exc.value.details)
     assert SENTINEL not in exc.value.message
+
+
+# --------------------------------------------------------------------------
+# 4.1 -- patch operation table consistency
+# --------------------------------------------------------------------------
+
+def test_patch_operation_tables_are_consistent():
+    import lib.patches as patches_mod
+    assert set(patches_mod._CHECKS) == set(patches_mod._APPLY) == patches_mod._OPERATIONS
+
+
+def test_every_op_with_source_refs_is_a_content_operation():
+    import lib.patches as patches_mod
+    from lib.schemas import Patch
+    from typing import get_args
+    patch_classes = get_args(get_args(Patch)[0])
+    for cls in patch_classes:
+        op = get_args(cls.model_fields["operation"].annotation)[0]
+        field_names = set(cls.model_fields)
+        carries_refs = "source_refs" in field_names or "new_content" in field_names
+        if carries_refs:
+            assert op in patches_mod._CONTENT_OPERATIONS, op
+
+
+# --------------------------------------------------------------------------
+# 4.2 Gap A -- an unprovenanced new skill-group category
+# --------------------------------------------------------------------------
+
+def test_new_skill_group_category_must_be_from_the_closed_list(m):
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(m, [add_skill("Kubernetes Expert, 5 Years Production", "Kubernetes")], workflow_id=WF)
+    assert "patch.skill_group_category" in _rules(exc)
+
+
+def test_new_skill_group_category_from_closed_list_is_allowed(m):
+    body, _ = validate_and_apply(m, [add_skill("Tools", "Kubernetes")], workflow_id=WF)
+    assert body["skills"][-1]["category"] == "Tools"
+
+
+def test_new_skill_group_familiarity_category_is_allowed_outside_closed_list(m):
+    body, _ = validate_and_apply(m, [add_skill("Currently Learning", "Kubernetes")], workflow_id=WF)
+    assert body["skills"][-1]["category"] == "Currently Learning"
+
+
+def test_existing_master_group_name_unaffected_by_closed_list(m):
+    # "Languages" already exists on the master; matched case-insensitively,
+    # so a bespoke existing name is never checked against the closed list.
+    body, _ = validate_and_apply(m, [add_skill("languages", "Zig")], workflow_id=WF)
+    assert any(g["category"] == "Languages" for g in body["skills"])
+
+
+def test_new_skill_group_category_rejects_metric(m):
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(m, [add_skill("Tools 5 years", "Kubernetes")], workflow_id=WF)
+    assert "patch.skill_group_category" in _rules(exc)
+
+
+def test_new_skill_group_category_rejects_high_scope_verb(m):
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(m, [add_skill("Led Tools", "Kubernetes")], workflow_id=WF)
+    assert "patch.skill_group_category" in _rules(exc)
+
+
+# --------------------------------------------------------------------------
+# 4.2 Gap B -- unbounded NewContent.metadata
+# --------------------------------------------------------------------------
+
+def test_metadata_too_many_keys_rejected(m):
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(m, [replace("exp-001-b01", metadata={"a": 1, "b": 2, "c": 3, "d": 4, "e": 5, "f": 6})],
+                           workflow_id=WF)
+    assert "patch.metadata_size" in _rules(exc)
+
+
+def test_metadata_nested_value_rejected(m):
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(m, [replace("exp-001-b01", metadata={"a": {"nested": True}})], workflow_id=WF)
+    assert "patch.metadata_size" in _rules(exc)
+
+
+def test_metadata_too_large_serialized_rejected(m):
+    with pytest.raises(ResumeTailorError) as exc:
+        validate_and_apply(m, [replace("exp-001-b01", metadata={"note": "x" * 250})], workflow_id=WF)
+    assert "patch.metadata_size" in _rules(exc)
+
+
+def test_metadata_small_scalar_dict_allowed(m):
+    body, _ = validate_and_apply(m, [replace("exp-001-b01", metadata={"note": "ok", "n": 1})], workflow_id=WF)
+    bullet = _bullet(body, "experience", "exp-001", "exp-001-b01")
+    assert bullet["metadata"] == {"note": "ok", "n": 1}

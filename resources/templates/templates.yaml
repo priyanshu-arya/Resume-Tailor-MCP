@@ -21,6 +21,15 @@
 # `source_file` are also read by the recommender and the md/docx exporter.
 # Section names match top-level resume keys; any listed section that isn't
 # part of the resume schema (e.g. "achievements") is documentation only.
+#
+# Completeness rule (lib/schemas.py: CONTRACT_REQUIREMENTS / contract_gaps):
+# a `status: supported` entry MUST fully specify every block/key listed in
+# CONTRACT_REQUIREMENTS -- no "unknown" anywhere in it. A `status:
+# experimental` entry MAY leave any of those fields "unknown", and an
+# unmeasured field MUST be the literal string "unknown" rather than a guess.
+# This is enforced both at load time (TemplateContract's model validator,
+# for a malformed registry in the repo) and at release time
+# (`template.contract_complete` in lib/release.py, for a hand-edited YAML).
 templates:
   - id: full-stack-modern
     name: Modern Full-Stack (colored headers, keyword-rich summary)
@@ -62,7 +71,7 @@ templates:
   - id: classic-minimalist
     name: Classic Minimalist (Jake's Resume style)
     status: supported
-    version: "1.1.0"
+    version: "1.2.0"
     source_file: Template 2.pdf
     page:
       size: letter
@@ -113,10 +122,45 @@ templates:
       link_style: hyperref hidelinks
     latex:
       documentclass_options: [letterpaper, 11pt]
+      layout_only_macros: [resumeSubheading, resumeProjectHeading]
       topmargin_adjust_in: -0.4
       textheight_adjust_in: 0.9
       side_margin_adjust_in: -0.4
       textwidth_adjust_in: 0.8
+    # Documentation-only map: contract path -> the check id that enforces it
+    # (or "n/a (...)" for a path that is structural/unmeasurable rather than
+    # a live check). Every CONTRACT_REQUIREMENTS key must appear here
+    # (validate_registry() checks this).
+    enforcement:
+      page.size: template.page_size
+      page.width_pt: template.page_size
+      page.height_pt: template.page_size
+      page.orientation: "n/a (implied by the exact width/height compare)"
+      page.margins_in: template.margins
+      typography.font_family: template.font_family
+      typography.pdf_font_prefixes: pdf.embedded_fonts
+      typography.body: template.body_font_size
+      typography.name: template.name_font_size
+      typography.heading: template.heading_font_size
+      typography.size_tolerance_pt: template.body_font_size
+      layout.sections: structure.section_order
+      layout.columns: template.columns
+      layout.tables_allowed: template.forbidden_structures
+      layout.text_boxes_allowed: template.forbidden_structures
+      layout.graphics_allowed: template.forbidden_structures
+      sections.order: structure.section_order
+      sections.headings: structure.section_headings
+      spacing.section: template.heading_style
+      spacing.bullet: template.spacing
+      spacing.line_spacing: template.spacing
+      limits.min_pages: pdf.page_count
+      limits.max_pages: pdf.page_count
+      formatting.bullet_style: template.bullet_style
+      formatting.date_style: "n/a (dates are not patchable; unmeasurable property)"
+      formatting.heading_style: template.heading_style
+      formatting.link_style: template.link_style
+      latex.documentclass_options: template.base_font_size
+      latex.layout_only_macros: template.forbidden_structures
     best_for:
       keywords: [research, api, backend, full-stack, ci/cd, git, rest,
                  microservices]
@@ -232,3 +276,179 @@ templates:
       notes: >
         JDs that emphasize measurable impact/scale, or candidates whose
         bullets are already metrics-heavy.
+
+  # -------------------------------------------------------------------------
+  # The three entries below are real, well-known open-source LaTeX templates
+  # (not in-house mockups like the five above). Each source_file is the
+  # actual upstream .tex/.cls compiled with ./bin/tectonic to produce the
+  # paired PDF -- not a redrawn approximation. Every one needed small,
+  # disclosed compatibility patches (marked "PATCHED for tectonic
+  # compatibility" inline in the .tex/.cls) to compile under the vendored
+  # tectonic binary: a font substituted for one requiring OS-level install,
+  # a fontawesome6 icon name aliased to its fontawesome5 equivalent, a
+  # biber-dependent bibliography section dropped (no biber binary vendored).
+  # None of these changes alter the template's layout, colors, or typography
+  # choices -- see `source.repo` for the unmodified original and
+  # `source.license` for its license. Like the five above, these are
+  # `experimental`: metadata + a reference PDF only, no renderer, not
+  # releasable. See resources/templates/<id>/ for the full source tree
+  # (class file, fonts, sub-included section files) needed to recompile.
+  #
+  # A fifth real template, an Awesome-CV academic-CV variant, was dropped:
+  # it shared the exact same .cls/visual design as awesome-cv-resume below,
+  # differing only in which sections were included -- a near-duplicate, not
+  # a visually distinct option.
+  #
+  # An AltaCV entry was also dropped from this registry (Phase 5, D-8
+  # follow-up): its source_file pointed at resources/templates/altacv/, but
+  # that directory (source tree + reference PDF) was never actually added to
+  # the repo, so `validate_registry()` would fail on a broken path. Re-add it
+  # only once the real AltaCV source tree and a compiled reference PDF are
+  # committed alongside it.
+  # -------------------------------------------------------------------------
+
+  - id: awesome-cv-resume
+    name: Awesome CV -- Resume (icon header, colored accent, dense professional)
+    status: experimental
+    version: "0.1.0"
+    source_file: awesome-cv-resume/resume-example.pdf
+    source:
+      repo: https://github.com/posquit0/Awesome-CV
+      license: LPPL-1.3c (class) / CC-BY-SA-4.0 (example content)
+      author: Claud D. Park (posquit0)
+      patched: >
+        fontawesome6 (not in the vendored tectonic bundle) swapped for
+        fontawesome5, with a handful of fa6-only icon names (mobile,
+        house-chimney, cake-candles, square-github/whatsapp/xing, x-twitter)
+        aliased to their fa5 equivalents. Source Sans 3/Roboto (OS-level
+        fonts fontspec can't resolve here) swapped for the CTAN roboto
+        package. Example contact details replaced with placeholders; the
+        employment history is the upstream author's own published example.
+    page: unknown
+    typography: unknown
+    layout:
+      sections: [summary, experience, honors, certifications, education]
+      unsupported_sections: [skills, projects]
+      columns: 1
+      tables_allowed: unknown
+      text_boxes_allowed: unknown
+      graphics_allowed: unknown
+      style: >
+        Centered header with icon-prefixed contact row, a single accent
+        color (default red) on name/section rules, dense single-column
+        experience section with bold company/role lines. Metadata only --
+        no renderer exists for this layout.
+    sections:
+      order: [summary, experience, honors, certifications, education]
+      headings: unknown
+    spacing: unknown
+    limits: unknown
+    formatting: unknown
+    latex: unknown
+    best_for:
+      keywords: [senior, staff, lead, infrastructure, devops, sre, backend]
+      experience_level: [senior, mid]
+      resume_signals: [many_experience_entries]
+      notes: >
+        Senior/staff-level candidates with a long work history and a
+        certifications list worth surfacing -- professional and dense
+        rather than design-forward.
+
+  - id: deedy-cv
+    name: Deedy CV (dense two-column, grayscale, education/coursework-heavy)
+    status: experimental
+    version: "0.1.0"
+    source_file: deedy-cv/deedy-cv-example.pdf
+    source:
+      repo: https://github.com/deedy/Deedy-Resume
+      license: Apache-2.0
+      author: Debarghya Das
+      patched: >
+        None needed beyond copying the bundled OpenFonts variant's fonts/
+        directory alongside the .tex (the template ships its own Lato/
+        Raleway font files, so no OS font install or CTAN substitution was
+        required). Compiled as-is with the vendored tectonic. Content is the
+        upstream author's own famous, widely-forked example resume --
+        de-identifying it would misrepresent this well-known reference, so
+        it is kept verbatim. Known limitation of the original template
+        (not a tectonic issue): very dense content can overflow/overlap at
+        the bottom of the fixed single-page two-column layout, as it does
+        here in the Awards/Publications area.
+    page: unknown
+    typography: unknown
+    layout:
+      sections: [education, skills, experience]
+      unsupported_sections: [coursework, links, research, awards,
+                              publications]
+      columns: unknown
+      tables_allowed: unknown
+      text_boxes_allowed: unknown
+      graphics_allowed: unknown
+      style: >
+        Grayscale two-column layout, oversized name in a thin display font,
+        education-first left column with coursework/skills, dense right
+        column for experience/research/awards/publications. No dedicated
+        certifications section in the upstream example. Metadata only -- no
+        renderer exists for this layout.
+    sections:
+      order: [education, skills, experience]
+      headings: unknown
+    spacing: unknown
+    limits: unknown
+    formatting: unknown
+    latex: unknown
+    best_for:
+      keywords: [research, new grad, graduate, campus, coursework]
+      experience_level: [intern, entry]
+      resume_signals: [many_achievements, coursework_relevant,
+                        research_experience]
+      notes: >
+        New-grad or research-adjacent candidates with a strong coursework/
+        awards list to fill the dense two-column format; overflows quickly
+        with more than ~1.5 pages of real content (see `patched` note).
+
+  - id: latexcv-two-column
+    name: LaTeXCV Two-Column (banner photo header, colored timeline entries)
+    status: experimental
+    version: "0.1.0"
+    source_file: latexcv-two-column/latexcv-two-column-example.pdf
+    source:
+      repo: https://github.com/jankapunkt/latexcv
+      license: MIT
+      author: Jan Küster
+      patched: >
+        None needed to compile (plain pdfLaTeX-compatible, CTAN roboto
+        package for fonts). The example's real photo and QR code were
+        replaced with generic placeholder images, and contact details with
+        placeholders; the education/experience body text is the upstream
+        author's own published example.
+    page: unknown
+    typography: unknown
+    layout:
+      sections: [summary, education, experience]
+      unsupported_sections: [loves, fields, status, skills]
+      columns: 2
+      tables_allowed: unknown
+      text_boxes_allowed: unknown
+      graphics_allowed: true
+      style: >
+        Photo banner under a colored name block, two-column body (education
+        left, experience right) with colored date labels and a colored
+        footer bar. Skills appear only as a "Tech:" keyword line inside the
+        summary sidebar, not a dedicated section. Metadata only -- no
+        renderer exists for this layout.
+    sections:
+      order: [summary, education, experience]
+      headings: unknown
+    spacing: unknown
+    limits: unknown
+    formatting: unknown
+    latex: unknown
+    best_for:
+      keywords: [consulting, IT, project management, fullstack]
+      experience_level: [mid]
+      resume_signals: []
+      notes: >
+        Candidates comfortable including a photo (common in EU/DE-market
+        CVs) who want a clean colored two-column layout distinct from the
+        AltaCV/Awesome-CV/Deedy visual families.

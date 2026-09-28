@@ -11,19 +11,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import shutil
 from pathlib import Path
 
 import pytest
 import yaml
 
 import server
-from lib import storage
+from lib import audit, storage
 from lib.errors import ResumeTailorError
+from tests.conftest import needs_tectonic
 
-REPO = Path(__file__).resolve().parent.parent
-pytestmark = pytest.mark.skipif(
-    not ((REPO / "bin" / "tectonic").exists() or shutil.which("tectonic")), reason="tectonic not available")
+pytestmark = needs_tectonic
 
 JD = "Backend Engineer\nRequirements:\n- Python\n- AWS\n"
 
@@ -52,10 +50,14 @@ def test_experimental_template_is_not_substituted_and_not_released(master):
 
 
 def test_release_happy_path_and_exact_identity(master):
+    ws, _, _ = master
     wf, vid = _tailor()
     rel = server.release_resume(vid, wf)
     assert rel["released"], rel["critical_failures"]
     assert {"page_count", "margins_in", "body_font_pt_modal"} <= set(rel["measured_properties"])
+    pdf_events = [e for e in audit.read_events(ws) if e["event"] == "pdf_compiled"]
+    assert pdf_events and pdf_events[-1]["status"] == "pass"
+    assert pdf_events[-1]["page_count"] == rel["measured_properties"]["page_count"]
     exported = server.export_resume(vid, wf)
     text, blob = exported[0].text, exported[1].resource.blob
     tex = text.split("```latex\n", 1)[1].rsplit("\n```", 1)[0]
@@ -71,6 +73,64 @@ def test_release_happy_path_and_exact_identity(master):
     assert report["released"] and report["version_id"] == vid and report["workspace_id"] == ws.id
     assert "Alex Example" not in report_files[0].read_text()  # no resume content in the report
     assert Path(json.loads(text.split("```json\n")[1].split("\n```")[0])["pdf_path"]).name.startswith("Alex_Example_")
+
+
+def test_lifecycle_state_is_derived_not_persisted(master):
+    """Phase 6 lifecycle decision: no stored 'validated' flag -- a version is
+    only ever draft or released, and every surface agrees."""
+    wf, vid = _tailor()
+    assert server.validate_version(vid, wf)["lifecycle_state"] == "draft"
+    assert {v["version_id"]: v["lifecycle_state"] for v in server.list_versions()["versions"]}[vid] == "draft"
+    status = server.get_workflow_status(wf)
+    assert {v["version_id"]: v["lifecycle_state"] for v in status["versions"]}[vid] == "draft"
+
+    rel = server.release_resume(vid, wf)
+    assert rel["lifecycle_state"] == "released"
+    assert server.validate_version(vid, wf)["lifecycle_state"] == "released"
+    assert {v["version_id"]: v["lifecycle_state"] for v in server.list_versions()["versions"]}[vid] == "released"
+    status = server.get_workflow_status(wf)
+    assert {v["version_id"]: v["lifecycle_state"] for v in status["versions"]}[vid] == "released"
+
+    again = server.release_resume(vid, wf)
+    assert again["lifecycle_state"] == "released"
+
+
+def test_flipped_pdf_byte_is_caught_on_export(master):
+    ws, _, _ = master
+    wf, vid = _tailor()
+    rel = server.release_resume(vid, wf)
+    assert rel["released"]
+    base = rel["export_basename"]
+    pdf_path = ws.exports_dir / f"{base}.pdf"
+    data = bytearray(pdf_path.read_bytes())
+    data[-1] ^= 0xFF  # flip the last byte
+    pdf_path.write_bytes(bytes(data))
+    out = server.export_resume(vid, wf, mode="release")
+    assert out["error"]["code"] == "NOT_RELEASED"
+
+
+def test_flipped_tex_byte_is_caught_on_export(master):
+    ws, _, _ = master
+    wf, vid = _tailor()
+    rel = server.release_resume(vid, wf)
+    assert rel["released"]
+    base = rel["export_basename"]
+    tex_path = ws.exports_dir / f"{base}.tex"
+    tex_path.write_text(tex_path.read_text(encoding="utf-8") + "% tampered\n", encoding="utf-8")
+    out = server.export_resume(vid, wf, mode="release")
+    assert out["error"]["code"] == "NOT_RELEASED"
+
+
+def test_second_release_writes_no_second_report(master):
+    ws, _, _ = master
+    wf, vid = _tailor()
+    rel = server.release_resume(vid, wf)
+    assert rel["released"]
+    before = sorted((ws.releases_dir).glob(f"{vid}-rel-*.json"))
+    again = server.release_resume(vid, wf)
+    assert again["already_released"]
+    after = sorted((ws.releases_dir).glob(f"{vid}-rel-*.json"))
+    assert before == after and len(after) == 1
 
 
 def test_released_version_is_immutable(master):
@@ -144,10 +204,48 @@ def test_master_change_after_tailoring_blocks_release(master):
     assert "source.master_hash" in {c["id"] for c in rel["critical_failures"]}
 
 
+def test_source_master_hash_mismatch_is_critical_and_skips_replay(master):
+    """When the master hash differs, provenance.replay is not appended at
+    all (not run against a master that no longer matches) -- assert both
+    halves, so its absence is never misread as a pass."""
+    from lib import release as _release
+    ws, doc, h = master
+    wf, vid = _tailor()
+    storage.save_master("resume", dict(doc, summary="Changed summary text for a new master revision."), h, "edit")
+    result = _release.validate(vid, wf)
+    ids = [c.id for c in result["report"].checks]
+    c = {c.id: c for c in result["report"].checks}["source.master_hash"]
+    assert (c.status, c.severity) == ("fail", "critical")
+    assert "provenance.replay" not in ids
+
+
 def test_master_preview_is_draft_only(master):
     assert server.export_resume("master-resume", mode="release")["error"]["code"] == "NOT_RELEASED"
     draft = server.export_resume("master-resume", mode="draft")
     assert "DRAFT / UNVERIFIED" in draft[0].text
+
+
+def test_missing_released_file_is_a_business_error(master):
+    """D-10: a released file deleted from disk must surface as NOT_RELEASED,
+    not an unhandled OSError turned into INTERNAL_ERROR."""
+    ws, _, _ = master
+    wf, vid = _tailor()
+    rel = server.release_resume(vid, wf)
+    assert rel["released"]
+    base = rel["export_basename"]
+    (ws.exports_dir / f"{base}.pdf").unlink()
+    out = server.export_resume(vid, wf, mode="release")
+    assert out["error"]["code"] == "NOT_RELEASED"
+
+
+def test_unknown_template_on_export_is_a_business_error(master):
+    """D-11: lib/export.py's internal template lookup must raise
+    TEMPLATE_UNKNOWN, not a bare ValueError surfacing as INTERNAL_ERROR."""
+    from lib import export as _export
+    from lib.errors import ResumeTailorError
+    with pytest.raises(ResumeTailorError) as e:
+        _export._section_order("not-a-real-template")
+    assert e.value.code == "TEMPLATE_UNKNOWN"
 
 
 def test_repair_path_after_blocked_release(workspace, legacy_master):
@@ -168,3 +266,33 @@ def test_repair_path_after_blocked_release(workspace, legacy_master):
     assert fixed["ok"], fixed
     rel = server.release_resume(fixed["version_id"], wf)
     assert rel["released"], rel["critical_failures"]
+
+
+def test_replay_with_an_added_project_entry(master):
+    wf = server.analyze_tailoring_requirements(JD)["workflow_id"]
+    saved = server.save_tailoring_evidence(
+        wf, "Kubernetes", "personal_project", "Built a personal Kubernetes operator for fun.", confirmed=True)
+    eid = saved["evidence"]["id"]
+    out = server.tailor_resume("acme-proj", [{
+        "operation": "add_project_entry", "name": "K8s Operator", "stack": "Kubernetes", "academic": False,
+        "source_refs": [{"type": "evidence", "id": eid}], "claim_strength": "personal_project",
+        "bullets": [{"text": "Built a Kubernetes operator to automate deployments.",
+                    "source_refs": [{"type": "evidence", "id": eid}]}],
+    }], wf, evidence_ids=[eid])
+    assert out["ok"], out
+    assert out["new_entry_ids"]
+    rel = server.release_resume(out["version_id"], wf)
+    assert rel["released"], rel["critical_failures"]
+    assert "provenance.replay" not in {c["id"] for c in rel.get("critical_failures", [])}
+
+
+def test_hand_added_project_fails_replay(master):
+    wf, vid = _tailor()
+    path = storage.version_path(vid)
+    doc = yaml.safe_load(path.read_text())
+    doc["projects"].append({"id": "vp-fake", "name": "Fabricated Project", "stack": "Kubernetes",
+                            "academic": False, "source_refs": [], "claim_strength": None, "bullets": []})
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    rel = server.release_resume(vid, wf)
+    assert rel["released"] is False
+    assert "provenance.replay" in {c["id"] for c in rel["critical_failures"]}

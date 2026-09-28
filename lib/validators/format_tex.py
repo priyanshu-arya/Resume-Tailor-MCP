@@ -24,6 +24,25 @@ from lib.schemas import Check
 SOURCE = "tex_inferred"
 UNKNOWN = "unknown"
 
+# Every check this module can emit, in report order.
+ALL_CHECK_IDS = (
+    "template.page_size",
+    "template.base_font_size",
+    "template.margins",
+    "template.margin_floor",
+    "template.body_font_size",
+    "template.body_font_floor",
+    "template.forbidden_structures",
+    "template.columns",
+    "template.font_family",
+    "template.name_font_size",
+    "template.heading_font_size",
+    "template.heading_style",
+    "template.spacing",
+    "template.bullet_style",
+    "template.link_style",
+)
+
 MARGIN_TOLERANCE_IN = 0.02
 MIN_MARGIN_IN = 0.5
 MIN_BODY_PT = 10.0
@@ -75,8 +94,28 @@ _CM_EQUIVALENT = {"latin modern roman", "latin modern", "computer modern", "comp
 _FORBIDDEN_ENVS = ("multicols", "multicols*", "minipage", "textblock", "textblock*", "tikzpicture",
                    "tabular", "tabular*", "tabularx", "longtable", "table", "figure", "wrapfigure", "picture")
 _FORBIDDEN_CMDS = ("includegraphics", "parbox", "fbox", "framebox", "colorbox", "fcolorbox")
-# The only allowed tabular*: the layout-only row macros of the classic template.
-LAYOUT_MACROS = ("resumeSubheading", "resumeProjectHeading")
+
+# Literal style-name -> required raw tokens, for `formatting.heading_style`.
+# An unrecognized style string is `not_available`, never a guess at `pass`.
+_HEADING_STYLE_TOKENS = {
+    "bold small caps + rule": (r"\bfseries", r"\scshape", r"\titlerule", r"\vspace{2pt}"),
+}
+_CENTER_RE = re.compile(r"\\begin\{center\}(.*?)\\end\{center\}", re.S)
+_TITLEFORMAT_SECTION_RE = re.compile(r"\\titleformat\{\\section\}([^\n]*)")
+_LINESPREAD_RE = re.compile(r"\\linespread\s*\{\s*([\d.]+)\s*\}")
+_BASELINESTRETCH_RE = re.compile(r"\\renewcommand\s*\{?\s*\\baselinestretch\s*\}?\s*\{")
+_SPACING_CMDS_RE = re.compile(r"\\(onehalfspacing|doublespacing)\b")
+_SETLIST_RE = re.compile(r"\\setlist(?:\[[^\]]*\])?\s*\{([^}]*)\}")
+
+
+def _layout_macros(contract: dict) -> tuple[str, ...]:
+    """The layout-only macro names a contract whitelists for the forbidden-
+    structure scan (e.g. resumeSubheading's internal tabularx). Contract-
+    driven, not hardcoded: an unknown/missing contract whitelists nothing, so
+    a `.tex` defining `\\newcommand{\\resumeSubheading}` can't smuggle a
+    tabularx body past the scan just by matching a name this module assumes."""
+    names = _field(contract, "latex", "layout_only_macros")
+    return tuple(names) if isinstance(names, list) else ()
 
 
 # --------------------------------------------------------------------------
@@ -106,9 +145,9 @@ def _brace_end(s: str, i: int) -> int:
     return len(s)
 
 
-def _remove_layout_macros(tex: str) -> str:
-    """Remove the definitions of the allowed layout-only macros."""
-    for name in LAYOUT_MACROS:
+def _remove_layout_macros(tex: str, macro_names: tuple[str, ...]) -> str:
+    """Remove the definitions of the contract-whitelisted layout-only macros."""
+    for name in macro_names:
         pattern = re.compile(r"\\(?:re)?newcommand\s*\{?\s*\\" + name + r"\s*\}?\s*(\[\d\])?\s*")
         m = pattern.search(tex)
         while m:
@@ -224,8 +263,8 @@ def _font_family(tex: str, packages) -> tuple[str, list[str]]:
     return family, decorative
 
 
-def _forbidden(tex: str) -> list[str]:
-    scan = _remove_layout_macros(tex)
+def _forbidden(tex: str, macro_names: tuple[str, ...]) -> list[str]:
+    scan = _remove_layout_macros(tex, macro_names)
     found = []
     for env in _FORBIDDEN_ENVS:
         if re.search(r"\\begin\s*\{" + re.escape(env) + r"\}", scan):
@@ -341,7 +380,7 @@ def check_tex(tex: str, contract: dict) -> tuple[list[Check], dict]:
                        f"Text set at {body_pt} pt, below the {MIN_BODY_PT:g} pt floor." if low_font else ""))
 
     # ---- forbidden structures / columns
-    forbidden = _forbidden(src)
+    forbidden = _forbidden(src, _layout_macros(contract))
     layout = _field(contract, "layout")
     if forbidden:
         checks.append(_chk("template.forbidden_structures", "fail", "error", "FORMAT", forbidden, [],
@@ -384,7 +423,116 @@ def check_tex(tex: str, contract: dict) -> tuple[list[Check], dict]:
                            {"family": family}, want_family,
                            "" if ok else f"Font family is {family}, contract requires {want_family}."))
 
+    # ---- name font size (\begin{center} block's size switch)
+    center = _CENTER_RE.search(src)
+    name_size_m = _SIZE_CMD_RE.search(center.group(1)) if center else None
+    name_pt = _SIZE_TABLE[base_pt].get(name_size_m.group(1)) if name_size_m else None
+    want_name = _field(contract, "typography", "name", "size_pt")
+    if want_name is None or name_pt is None:
+        checks.append(_na("template.name_font_size", "error", "TEMPLATE", name_pt,
+                          "Contract name size is unknown." if want_name is None else
+                          "No size-switch command found in the \\begin{center} header block."))
+    else:
+        ok = abs(name_pt - float(want_name)) <= tol + _EPS
+        checks.append(_chk("template.name_font_size", "pass" if ok else "fail", "error", "TEMPLATE", name_pt,
+                           {"size_pt": want_name, "tolerance_pt": tol},
+                           "" if ok else f"Header name size is {name_pt} pt, contract requires {want_name} pt."))
+
+    # ---- heading font size + heading style (\titleformat{\section} line)
+    title_m = _TITLEFORMAT_SECTION_RE.search(src)
+    title_line = title_m.group(1) if title_m else None
+    heading_size_m = _SIZE_CMD_RE.search(title_line) if title_line else None
+    heading_pt = _SIZE_TABLE[base_pt].get(heading_size_m.group(1)) if heading_size_m else None
+    want_heading = _field(contract, "typography", "heading", "size_pt")
+    if want_heading is None or heading_pt is None:
+        checks.append(_na("template.heading_font_size", "error", "TEMPLATE", heading_pt,
+                          "Contract heading size is unknown." if want_heading is None else
+                          "No \\titleformat{\\section} size switch found."))
+    else:
+        ok = abs(heading_pt - float(want_heading)) <= tol + _EPS
+        checks.append(_chk("template.heading_font_size", "pass" if ok else "fail", "error", "TEMPLATE", heading_pt,
+                           {"size_pt": want_heading, "tolerance_pt": tol},
+                           "" if ok else f"Section heading size is {heading_pt} pt, contract requires {want_heading} pt."))
+
+    want_heading_style = _field(contract, "formatting", "heading_style")
+    if want_heading_style is None:
+        checks.append(_na("template.heading_style", "error", "FORMAT", title_line, "Contract heading style is unknown."))
+    elif str(want_heading_style) not in _HEADING_STYLE_TOKENS:
+        checks.append(_na("template.heading_style", "error", "FORMAT", title_line,
+                          f"Unrecognized heading style {want_heading_style!r}; not asserting a guess."))
+    elif title_line is None:
+        checks.append(_chk("template.heading_style", "fail", "error", "FORMAT", None, want_heading_style,
+                           "No \\titleformat{\\section} found."))
+    else:
+        required = _HEADING_STYLE_TOKENS[str(want_heading_style)]
+        missing = [t for t in required if t not in title_line]
+        checks.append(_chk("template.heading_style", "fail" if missing else "pass", "error", "FORMAT",
+                           title_line, list(required),
+                           f"Heading style is missing: {', '.join(missing)}." if missing else ""))
+
+    # ---- spacing (bullet \setlist k=v pairs; no compressed line spacing)
+    setlist_m = _SETLIST_RE.search(src)
+    setlist_kv = dict(p.split("=", 1) for p in (setlist_m.group(1).split(",") if setlist_m else []) if "=" in p)
+    setlist_kv = {k.strip(): v.strip() for k, v in setlist_kv.items()}
+    want_bullet = _field(contract, "spacing", "bullet")
+    want_line_spacing = _field(contract, "spacing", "line_spacing")
+    spacing_problems = []
+    if isinstance(want_bullet, str) and want_bullet:
+        for pair in want_bullet.split(","):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            key, val = (x.strip() for x in pair.split("=", 1))
+            if setlist_kv.get(key) != val:
+                spacing_problems.append(f"\\setlist {key}={setlist_kv.get(key)!r}, contract requires {val!r}")
+    linespread_m = _LINESPREAD_RE.search(src)
+    if linespread_m and abs(float(linespread_m.group(1)) - 1.0) > _EPS:
+        spacing_problems.append(f"\\linespread{{{linespread_m.group(1)}}} compresses/expands line spacing")
+    if _BASELINESTRETCH_RE.search(src):
+        spacing_problems.append("\\baselinestretch is redefined")
+    spacing_cmd_m = _SPACING_CMDS_RE.search(src)
+    if spacing_cmd_m:
+        spacing_problems.append(f"\\{spacing_cmd_m.group(1)} changes line spacing away from single")
+    if want_bullet is None and want_line_spacing is None:
+        checks.append(_na("template.spacing", "error", "FORMAT", setlist_kv, "Contract spacing is unknown."))
+    else:
+        checks.append(_chk("template.spacing", "fail" if spacing_problems else "pass", "error", "FORMAT",
+                           setlist_kv, {"bullet": want_bullet, "line_spacing": want_line_spacing},
+                           "; ".join(spacing_problems) if spacing_problems else ""))
+
+    # ---- bullet style (itemize only, no enumerate/description)
+    has_itemize = bool(re.search(r"\\begin\{itemize\}", src))
+    bad_lists = [e for e in ("enumerate", "description") if re.search(r"\\begin\{" + e + r"\}", src)]
+    want_bullet_style = _field(contract, "formatting", "bullet_style")
+    if want_bullet_style is None:
+        checks.append(_na("template.bullet_style", "error", "FORMAT", {"itemize": has_itemize, "other": bad_lists},
+                          "Contract bullet style is unknown."))
+    else:
+        ok = has_itemize and not bad_lists and str(want_bullet_style) == "itemize"
+        checks.append(_chk("template.bullet_style", "pass" if ok else "fail", "error", "FORMAT",
+                           {"itemize": has_itemize, "other": bad_lists}, want_bullet_style,
+                           "" if ok else f"Expected only itemize lists; found other list type(s): {bad_lists}."
+                           if bad_lists else "No itemize list found." if not has_itemize else ""))
+
+    # ---- link style (hyperref hidelinks, warning-severity)
+    hyperref_opts = next((opts for opts, name in packages if name == "hyperref"), None)
+    want_link_style = _field(contract, "formatting", "link_style")
+    if want_link_style is None:
+        checks.append(_na("template.link_style", "warning", "FORMAT", hyperref_opts, "Contract link style is unknown."))
+    elif hyperref_opts is None:
+        checks.append(_chk("template.link_style", "fail", "warning", "FORMAT", None, want_link_style,
+                           "No hyperref package loaded."))
+    else:
+        colorlinks = "colorlinks" in hyperref_opts or "colorlinks=true" in hyperref_opts
+        hidelinks = "hidelinks" in hyperref_opts
+        ok = hidelinks and not colorlinks
+        checks.append(_chk("template.link_style", "pass" if ok else "fail", "warning", "FORMAT",
+                           hyperref_opts, want_link_style,
+                           "" if ok else ("colorlinks is set; links must be hidelinks." if colorlinks else
+                                         "hyperref is missing the hidelinks option.")))
+
     inferred = {"page_size": paper, "base_font_pt": base_pt, "class_size_option": requested,
                 "body_font_pt": body_pt, "margins_in": margins, "columns": columns,
-                "forbidden": forbidden, "font_family": family}
+                "forbidden": forbidden, "font_family": family, "name_font_pt": name_pt,
+                "heading_font_pt": heading_pt, "bullet_spacing": setlist_kv}
     return checks, inferred

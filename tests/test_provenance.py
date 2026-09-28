@@ -93,7 +93,7 @@ def rule_ids(rejs) -> set[str]:
 
 def test_rules_version_matches_yaml():
     data = load_file(rules.ETIQUETTE_PATH)
-    assert rules.rules_version() == data["rules_version"] == "2026.09-v2.0"
+    assert rules.rules_version() == data["rules_version"] == "2026.10-v2.1"
 
 
 def test_placement_matrix_and_fail_closed():
@@ -263,7 +263,7 @@ def test_claim_strength_above_evidence_rejected(m):
 
 
 def test_master_skill_item_claim_up_to_professional_passes(m):
-    run(m, [add_skill("Backend", "Python", [mref("skill-python")], claim_strength="professional")])
+    run(m, [add_skill("Platforms", "Python", [mref("skill-python")], claim_strength="professional")])
 
 
 def test_one_ref_with_no_placement_rejects_whole_patch(m):
@@ -308,3 +308,107 @@ def test_messages_do_not_quote_patch_text(m):
     for r in rejs:
         assert SENTINEL not in r["message"]
         assert "77" not in r["message"]
+
+
+# --------------------------------------------------------------------------
+# 4.3 -- skill-item provenance confirmation tests
+# --------------------------------------------------------------------------
+
+def test_one_evidence_cannot_justify_two_unrelated_skills(m):
+    # ev-fastapi's text/term is FastAPI; a second, unrelated skill name
+    # citing the same record is rejected on its own patch (each add_skill_item
+    # is its own patch with its own refs -- one source cannot justify a group).
+    body, _ = run(m, [add_skill("Frameworks", "FastAPI", [eref("ev-fastapi")])])
+    assert body["skills"][-1]["items"][-1]["name"] == "FastAPI"
+    rejs = rejected(m, [add_skill("Frameworks", "Django", [eref("ev-fastapi")])])
+    assert "provenance.unsupported_technology" in rule_ids(rejs)
+
+
+def test_group_id_cannot_be_used_as_a_source_ref(m):
+    rejs = rejected(m, [add_skill("Tools", "Terraform", [mref("skg-001")])])
+    assert "provenance.uncitable_ref" in rule_ids(rejs)
+
+
+# --------------------------------------------------------------------------
+# 4.4 -- scope inflation (verb swapped, inflation kept) + rules_version drift
+# --------------------------------------------------------------------------
+
+def test_scope_inflation_marker_without_matching_source_rejected(m):
+    text = "Deployed enterprise-grade AWS infrastructure serving thousands of users across multiple regions."
+    rejs = rejected(m, [add_block(PROJ, text, [eref("ev-aws")], claim_strength="personal_project")])
+    assert "provenance.scope_inflation" in rule_ids(rejs)
+
+
+def test_scope_inflation_marker_present_in_cited_source_passes(m):
+    evd = dict(EV, **{"ev-aws-enterprise": ev("ev-aws-enterprise", "AWS", "personal_project",
+                    "Deployed an enterprise-grade AWS setup for my personal project across multiple regions")})
+    body, _ = run(m, [add_block(PROJ, "Deployed enterprise-grade AWS infrastructure across multiple regions.",
+                                [eref("ev-aws-enterprise")], claim_strength="personal_project")], evidence=evd)
+    assert body  # no rejection
+
+
+# --------------------------------------------------------------------------
+# 4.5 -- metric provenance, adversarial coverage
+# --------------------------------------------------------------------------
+
+def test_rounded_up_metric_rejected(m):
+    rejs = rejected(m, [replace(B_BUILT, "Built 18 Python/Django REST endpoints, cutting latency 45%.",
+                                [mref(B_BUILT)])])
+    assert "provenance.unsupported_metric" in rule_ids(rejs)
+
+
+def test_metric_unit_swapped_rejected(m):
+    rejs = rejected(m, [replace(B_BUILT, "Built 18 Python/Django REST endpoints, cutting latency 42x.",
+                                [mref(B_BUILT)])])
+    assert "provenance.unsupported_metric" in rule_ids(rejs)
+
+
+def test_metric_unit_swapped_to_ms_rejected(m):
+    rejs = rejected(m, [replace(B_BUILT, "Built 18 Python/Django REST endpoints, cutting latency 42ms.",
+                                [mref(B_BUILT)])])
+    assert "provenance.unsupported_metric" in rule_ids(rejs)
+
+
+def test_percentage_invented_from_a_ratio_rejected(m):
+    rejs = rejected(m, [replace(PROJ_B, "Created a retrieval tool over 2,000 notes, improving recall by 15%.",
+                                [mref(PROJ_B)])])
+    assert "provenance.unsupported_metric" in rule_ids(rejs)
+
+
+def test_currency_changed_rejected(m):
+    evd = dict(EV, **{"ev-cost": ev("ev-cost", "AWS", "personal_project", "Cut my AWS bill by $500 a month",
+                                    metrics=["$500"])})
+    rejs = rejected(m, [add_block(PROJ, "Cut AWS spend by ₹500 a month.", [eref("ev-cost")],
+                                  claim_strength="personal_project")], evidence=evd)
+    assert "provenance.unsupported_metric" in rule_ids(rejs)
+
+
+def test_currency_dropped_is_allowed_known_looseness(m):
+    # Deliberate asymmetry: a currency sign may be dropped from new text
+    # (never added or changed) -- see lib/validators/provenance._metric_supported.
+    evd = dict(EV, **{"ev-cost": ev("ev-cost", "AWS", "personal_project", "Cut my AWS bill by $500 a month",
+                                    metrics=["$500"])})
+    body, _ = run(m, [add_block(PROJ, "Cut AWS spend by 500 a month.", [eref("ev-cost")],
+                                claim_strength="personal_project")], evidence=evd)
+    assert body
+
+
+def test_metric_present_only_in_jd_is_rejected(m):
+    # A number that only appears in the JD (never cited by any ref) is not
+    # in the metric pool at all, regardless of context.
+    rejs = rejected(m, [add_block(PROJ, "Reduced latency by 99%.", [eref("ev-aws")],
+                                  claim_strength="personal_project")])
+    assert "provenance.unsupported_metric" in rule_ids(rejs)
+
+
+def test_metric_pool_shared_across_refs_is_a_known_looseness(m):
+    # Known looseness (documented in README): the metric pool is the UNION of
+    # every cited ref's metrics, so a number from one ref can back a claim
+    # about a different ref's subject as long as both are cited together.
+    evd = dict(EV, **{
+        "ev-a": ev("ev-a", "AWS", "personal_project", "Deployed on AWS", metrics=[]),
+        "ev-b": ev("ev-b", "Kubernetes", "personal_project", "Cut costs by 30% using Kubernetes", metrics=["30%"]),
+    })
+    body, _ = run(m, [add_block(PROJ, "Deployed on AWS, cutting costs by 30%.", [eref("ev-a"), eref("ev-b")],
+                                claim_strength="personal_project")], evidence=evd)
+    assert body

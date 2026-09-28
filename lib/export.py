@@ -24,7 +24,8 @@ def _section_order(template_id: str | None) -> list[str]:
         return _DEFAULT_SECTION_ORDER
     tmpl = _templates.get_template(template_id)
     if tmpl is None:
-        raise ValueError(f"Unknown template '{template_id}'. Use list_templates to see valid ids.")
+        raise ResumeTailorError("TEMPLATE_UNKNOWN", f"Unknown template {template_id!r}. "
+                                "Use list_templates to see valid ids.")
     # Layouts may reference sections (e.g. "achievements") that aren't part
     # of the resume schema -- drop anything we don't know how to render.
     return [s for s in tmpl["layout"]["sections"] if s in _DEFAULT_SECTION_ORDER]

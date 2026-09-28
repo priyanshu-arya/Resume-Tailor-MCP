@@ -15,9 +15,27 @@ including the strict page-length/formatting/no-fabrication rules) and
 `resume://etiquette` / `resources/resume_etiquette.yaml`. Read both before
 writing any content.
 
-## 0. Initialize workspace
+## 0. Resolve the workspace first -- never create one blind
 
-Call `initialize_workspace()`. It is idempotent -- safe to call when the
+Call `get_workspace_status()`. It never raises; it reports one of four
+states, and never guesses which workspace or which person you're working
+with:
+
+- **`NO_WORKSPACE`** -- nothing on this machine yet. Ask "Is this the first
+  time Resume Tailor has been used on this computer?" Yes -> call
+  `initialize_workspace()`. No (the user expects existing data) -> call
+  `list_workspaces()`, show them what exists, and `select_workspace(id)`
+  only after they say which one is theirs.
+- **`WORKSPACE_INVALID`** -- the binding is broken or ambiguous
+  (`available_workspace_ids` lists what's on disk). `list_workspaces()`,
+  ask, `select_workspace(id)`. **Never** call `initialize_workspace()` here
+  -- that would create a new, empty workspace and orphan the existing data.
+- **`WORKSPACE_NEEDS_SETUP`** -- a workspace is bound but has no usable
+  master yet. Continue at step 1.
+- **`WORKSPACE_FOUND`** -- a master of at least one kind already exists.
+  Continue at step 1; step 2 handles protecting it.
+
+`initialize_workspace()` is idempotent -- safe to call again when the
 workspace already exists. Masters live in `~/.resume-tailor/` (or
 `$RESUME_TAILOR_HOME`), not in this repository.
 
@@ -44,19 +62,45 @@ Call `get_master_resume(kind=kind)`. If one already exists:
 
 If none exists, proceed to step 3.
 
-## 3. Ask for source material
+## 3. Ask for source material -- folder, not memory
 
 Ask whether they have an existing file to import, or want to build from
 scratch through an interview:
 
-- **Existing file** (PDF/DOCX/MD/TXT): use `set_master_resume` (step 4).
+- **Existing file**: ask "Which folder on this computer has your current
+  resume or CV?" Then call `discover_masters(folder)`:
+  - **1 candidate** -- confirm the filename and the kind (resume/cv) with
+    the user, then `import_master_from_folder(folder, filename, kind)`.
+  - **>1 candidates** -- list each one's filename, kind guess and the
+    reason for the guess; ask which ONE file and which kind to import.
+    Never pick for them, even when one candidate looks obviously right.
+  - **Resume AND CV both present** -- ask which to configure now; run this
+    skill again for the other. Never merge them into one document.
+  - **`NO_MASTER_CANDIDATES`** -- ask for a different folder, or move on to
+    the interview below. **Do not** offer to reconstruct their resume from
+    what you remember, from this conversation, or from anything discussed
+    earlier -- the only sources are the master and the candidate's own
+    words.
+
+  After a successful import, read the provenance back to the user, e.g.
+  "Imported `<filename>` from `<folder name>`." (`import_master_from_folder`'s
+  result includes `import_provenance`; `get_master_history(kind)` shows it
+  again later.) This skill still applies below for a file that needs
+  cleanup after import (`unparsed` content, formatting).
 - **From scratch, no file**: use the `create-cv` skill's interview process
-  to gather content, then continue from step 4 with the assembled dict.
+  to gather content, then continue from step 4 with the assembled dict via
+  `set_master_resume(kind=kind, resume=<dict>, ...)`.
 
 Either way: use only what the candidate actually gives you. Never invent
 experience, skills, achievements, projects, dates, or metrics to fill a gap.
 
 ## 4. Import or set the master (two-step confirm)
+
+This step is for the from-scratch (`resume=<dict>`) path. `import_master_from_folder`
+(step 3's existing-file path) already ran its own copy of this exact
+preview/confirm protocol -- if it returned `applied: false`, show the user
+the diff it returned and call it again with `confirm=True` plus the
+`current_hash`/`proposed_hash` it gave you; skip the rest of this step.
 
 `set_master_resume` takes two calls when overwriting an existing master:
 

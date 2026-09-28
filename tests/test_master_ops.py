@@ -195,3 +195,125 @@ def test_preview_is_deterministic(master, md_file):
 def test_readiness_helper():
     assert master_ops.master_readiness({"unparsed": []})["ready"] is True
     assert master_ops.master_readiness({"unparsed": ["x"], "metadata": {"unparsed_accepted": True}})["ready"] is True
+
+
+# --------------------------------------------------------------------------
+# D-2 regression: a tailored version can never become the master
+# --------------------------------------------------------------------------
+
+def test_tailored_version_dict_rejected_as_master(workspace, legacy_master):
+    version_like = dict(legacy_master)
+    version_like["metadata"] = {
+        "kind": "resume", "version_id": "v1", "released": True, "release_report_id": "rel-x",
+        "document_kind": "resume", "created_at": "2026-01-01T00:00:00Z", "workspace_id": workspace.id,
+    }
+    with pytest.raises(ResumeTailorError) as e:
+        master_ops.set_master("resume", resume=version_like, ws=workspace)
+    assert _code(e) == "MASTER_INVALID"
+    assert "version_fields" in e.value.details
+    assert set(e.value.details["version_fields"]) & {"version_id", "released", "release_report_id"}
+
+
+def test_version_document_rejected_even_with_only_one_marker(workspace, legacy_master):
+    version_like = dict(legacy_master)
+    version_like["metadata"] = {"kind": "resume", "workflow_id": "wf-1"}
+    with pytest.raises(ResumeTailorError) as e:
+        master_ops.set_master("resume", resume=version_like, ws=workspace)
+    assert _code(e) == "MASTER_INVALID"
+
+
+def test_ordinary_master_without_version_markers_is_accepted(workspace, legacy_master):
+    r = master_ops.set_master("resume", resume=legacy_master, ws=workspace)
+    assert r["applied"] is True
+
+
+def test_version_document_rejected_on_replace_over_existing_master(master, legacy_master):
+    ws, doc, h = master
+    version_like = dict(legacy_master)
+    version_like["metadata"] = {"kind": "resume", "version_id": "v1"}
+    with pytest.raises(ResumeTailorError) as e:
+        master_ops.set_master("resume", resume=version_like, expected_hash=h, ws=ws)
+    assert _code(e) == "MASTER_INVALID"
+    # nothing was written -- the master is untouched
+    assert storage.load_master("resume", ws) == (doc, h)
+
+
+# --------------------------------------------------------------------------
+# A caller cannot forge server-owned metadata (migration/imported/id_counters)
+# --------------------------------------------------------------------------
+
+def test_caller_cannot_forge_imported_metadata(workspace, legacy_master):
+    forged = dict(legacy_master)
+    forged["metadata"] = {"kind": "resume", "imported": {
+        "source": "user_folder", "source_filename": "fake.md", "source_folder_name": "fake",
+        "source_folder_hash": "fake", "source_hash": "fake"}}
+    r = master_ops.set_master("resume", resume=forged, ws=workspace)
+    assert r["applied"] is True
+    doc, _ = storage.load_master("resume", workspace)
+    assert doc["metadata"].get("imported") is None
+
+
+def test_caller_cannot_forge_id_counters(workspace, legacy_master):
+    forged = dict(legacy_master)
+    forged["metadata"] = {"kind": "resume", "id_counters": {"exp-": 9999}}
+    r = master_ops.set_master("resume", resume=forged, ws=workspace)
+    assert r["applied"] is True
+    doc, _ = storage.load_master("resume", workspace)
+    assert doc["metadata"].get("id_counters", {}).get("exp-") != 9999
+
+
+def test_caller_cannot_forge_migration_metadata(workspace, legacy_master):
+    forged = dict(legacy_master)
+    forged["metadata"] = {"kind": "resume", "migration": {
+        "source": "legacy_repository", "source_hash": "fake", "migrated_at": "2020-01-01T00:00:00Z",
+        "legacy_path": "/fake/path"}}
+    r = master_ops.set_master("resume", resume=forged, ws=workspace)
+    assert r["applied"] is True
+    doc, _ = storage.load_master("resume", workspace)
+    assert doc["metadata"].get("migration") is None
+
+
+# --------------------------------------------------------------------------
+# import_info: deterministic across preview/confirm, carried forward on update
+# --------------------------------------------------------------------------
+
+def test_import_info_is_deterministic_across_preview_and_confirm(master, md_file):
+    ws, doc, h = master
+    info = {"source": "user_folder", "source_filename": "resume.md", "source_folder_name": "f",
+            "source_folder_hash": "abc", "source_hash": "def"}
+    preview = master_ops.set_master("resume", file_path=str(md_file), import_info=info, ws=ws)
+    assert preview["applied"] is False
+    confirmed = master_ops.set_master(
+        "resume", file_path=str(md_file), import_info=info, ws=ws,
+        confirm=True, expected_hash=preview["current_hash"], proposed_hash=preview["proposed_hash"])
+    assert confirmed["applied"] is True
+    assert confirmed["import_provenance"]["source_filename"] == "resume.md"
+
+
+def test_import_info_carried_forward_on_update_not_replace(master, md_file):
+    ws, doc, h = master
+    info = {"source": "user_folder", "source_filename": "resume.md", "source_folder_name": "f",
+            "source_folder_hash": "abc", "source_hash": "def"}
+    preview = master_ops.set_master("resume", file_path=str(md_file), import_info=info, ws=ws)
+    imported = master_ops.set_master(
+        "resume", file_path=str(md_file), import_info=info, ws=ws,
+        confirm=True, expected_hash=h, proposed_hash=preview["proposed_hash"])
+    assert imported["import_provenance"]["source_filename"] == "resume.md"
+    doc_after_import, hash_after_import = storage.load_master("resume", ws)
+
+    # mode="update" without import_info -- the SAME document is being edited,
+    # so provenance must be carried forward, not silently lost
+    body = {k: v for k, v in doc_after_import.items() if k != "metadata"}
+    r_update = master_ops.set_master("resume", resume=body, mode="update", ws=ws,
+                                     expected_hash=hash_after_import,
+                                     proposed_hash=master_ops.set_master(
+                                         "resume", resume=body, mode="update", ws=ws)["proposed_hash"],
+                                     confirm=True)
+    assert r_update["import_provenance"]["source_filename"] == "resume.md"
+
+    # a plain replace (a NEW document) must NOT carry stale provenance forward
+    doc_after_update, hash_after_update = storage.load_master("resume", ws)
+    preview2 = master_ops.set_master("resume", resume=body, ws=ws)
+    r_replace = master_ops.set_master("resume", resume=body, ws=ws, confirm=True,
+                                      expected_hash=hash_after_update, proposed_hash=preview2["proposed_hash"])
+    assert "import_provenance" not in r_replace

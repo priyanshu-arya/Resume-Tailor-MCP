@@ -277,3 +277,68 @@ def test_deleted_ids_are_never_reissued(legacy_master):
     doc["experience"].append({"title": "Another", "company": "Delta", "bullets": []})
     assign_ids(doc)
     assert doc["experience"][1]["id"] == "exp-004"
+
+
+def test_skill_item_ids_are_content_derived_not_counter_backed(legacy_master):
+    """Phase 2 gap 4 (docs/baseline.md D-6): every other ID family is
+    counter-backed via metadata.id_counters (see _next_free); skill items
+    are the one deliberate exception -- their ID is derived from the item's
+    slugified name, and assign_ids explicitly excludes 'skill-' from the
+    high-water-mark bookkeeping (see the `not u.startswith("skill-")` guard).
+
+    This pins the CURRENT, intentional behaviour: re-adding a deleted skill
+    with the same name reissues the same ID (benign -- same name, same
+    block), but renaming a skill changes its ID, so an older version's ref
+    to the old skill-<slug> id stops resolving. That is a known, accepted
+    limitation (see README Known Limitations), not something this test
+    argues should change -- it exists so a future change to this behaviour
+    is a deliberate decision, not an accidental side effect."""
+    from lib.ids import assign_ids, normalize_master
+    doc = normalize_master(legacy_master, "resume")
+    python_id = next(i["id"] for g in doc["skills"] for i in g["items"] if i.get("name") == "Python")
+    assert python_id == "skill-python"
+    assert "skill-" not in doc["metadata"]["id_counters"]
+
+    # deleting and re-adding the SAME name reissues the SAME id (benign)
+    for g in doc["skills"]:
+        g["items"] = [i for i in g["items"] if i.get("id") != python_id]
+    doc["skills"][0]["items"].append({"name": "Python"})
+    assign_ids(doc)
+    reissued_id = next(i["id"] for g in doc["skills"] for i in g["items"] if i.get("name") == "Python")
+    assert reissued_id == python_id
+
+    # renaming produces a DIFFERENT id -- the accepted limitation this test pins
+    doc2 = normalize_master(legacy_master, "resume")
+    for g in doc2["skills"]:
+        for item in g["items"]:
+            if item.get("id") == python_id:
+                item["name"] = "Python3"
+                del item["id"]
+    assign_ids(doc2)
+    renamed_id = next(i["id"] for g in doc2["skills"] for i in g["items"] if i.get("name") == "Python3")
+    assert renamed_id != python_id
+
+
+def test_every_section_has_an_id_family(legacy_master):
+    """Table-driven: every section that can hold citable content has a
+    counter-backed ID family, so a new section can never ship without IDs."""
+    from lib.ids import normalize_master
+    doc = normalize_master(legacy_master, "resume")
+    counters = doc["metadata"]["id_counters"]
+
+    assert doc["summary"] and doc.get("metadata")  # summary uses the fixed SUMMARY_ID, not a counter
+    from lib.schemas import SUMMARY_ID
+    assert SUMMARY_ID == "sum-001"
+
+    expected_prefixes = {"exp-", "proj-", "edu-", "skg-", "cert-"}
+    assert expected_prefixes <= set(counters), (
+        f"missing counter-backed families: {expected_prefixes - set(counters)}")
+
+    for section, id_prefix in (("experience", "exp-"), ("projects", "proj-"),
+                               ("education", "edu-"), ("certifications", "cert-")):
+        for entry in doc[section]:
+            assert entry["id"].startswith(id_prefix), entry
+    for g in doc["skills"]:
+        assert g["id"].startswith("skg-"), g
+        for item in g["items"]:
+            assert item["id"].startswith("skill-"), item

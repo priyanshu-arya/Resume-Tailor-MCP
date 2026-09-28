@@ -35,6 +35,11 @@ ERROR_CATEGORIES: dict[str, str] = {
     "IMPORT_UNSUPPORTED": "SOURCE",
     "MIGRATION_CONFLICT": "WORKFLOW",
     "MIGRATION_NO_LEGACY": "WORKFLOW",
+    # workspace identity / discovery (R-USER-*, spec-map §4-6)
+    "WORKSPACE_AMBIGUOUS": "WORKFLOW",   # workspaces exist on disk, none is bound
+    "WORKSPACE_NOT_FOUND": "WORKFLOW",   # select_workspace(<id>) and that dir does not exist
+    "FOLDER_UNSUPPORTED": "SOURCE",      # not a dir / unreadable / inside app_root or the repo
+    "NO_MASTER_CANDIDATES": "SOURCE",    # the folder was scanned and held nothing importable
     # tailoring / provenance
     "PATCH_INVALID": "FACTUAL",
     "PROVENANCE_VIOLATION": "FACTUAL",
@@ -47,6 +52,7 @@ ERROR_CATEGORIES: dict[str, str] = {
     "TEMPLATE_UNKNOWN": "TEMPLATE",
     "TEMPLATE_NO_RENDERER": "TEMPLATE",
     "TEMPLATE_NOT_RELEASABLE": "TEMPLATE",
+    "TEMPLATE_REGISTRY_INVALID": "TEMPLATE",
     "VALIDATION_FAILED": "FORMAT",
     "PDF_VALIDATION_UNAVAILABLE": "LATEX_PDF",
     "LATEX_COMPILE_FAILED": "LATEX_PDF",

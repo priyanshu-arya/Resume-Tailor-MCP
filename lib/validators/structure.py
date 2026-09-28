@@ -18,6 +18,20 @@ from lib.validators.content import document_kind, required_sections
 
 UNKNOWN = "unknown"
 
+# Every check this module can emit, in report order.
+ALL_CHECK_IDS = (
+    "structure.document_kind",
+    "structure.required_sections",
+    "structure.section_order",
+    "structure.standard_headings",
+    "structure.provenance_complete",
+    "structure.master_refs_resolve",
+    "structure.evidence_refs_resolve",
+    "structure.new_entry_provenance",
+    "structure.unknown_entry",
+    "structure.unknown_jd_requirements",
+)
+
 # The order lib/latex.render_latex emits sections in (classic-minimalist).
 # The renderer, not the document, controls order; a contract order must be a
 # subsequence of this or the PDF would not match the contract.
@@ -194,6 +208,50 @@ def _check_provenance(doc: dict, master_index: dict | None, evidence: dict | Non
     return out
 
 
+def _check_new_entry_provenance(doc: dict, master_index: dict | None) -> Check:
+    """A project entry NOT in the master (i.e. one add_project_entry created)
+    must carry its own source_refs -- `_claims()` walks bullets/skills/certs/
+    summary but never an entry itself, so a new entry's own provenance (its
+    name/stack) would otherwise go unchecked here."""
+    if master_index is None:
+        return _chk("structure.new_entry_provenance", "not_available", "critical", "FACTUAL", "provenance",
+                    None, None, "No master index supplied.")
+    bad = []
+    for i, entry in enumerate(doc.get("projects") or []):
+        if not isinstance(entry, dict):
+            continue
+        eid = entry.get("id") or f"projects[{i}]"
+        if entry.get("id") in master_index:
+            continue
+        refs = _refs(entry)
+        if not refs:
+            bad.append(eid)
+    return _chk("structure.new_entry_provenance", "fail" if bad else "pass", "critical", "FACTUAL", "provenance",
+                bad, [], f"{len(bad)} new project entry(ies) have no source_refs: {_list_ids(bad)}." if bad else "")
+
+
+def _check_unknown_entry(doc: dict, master_index: dict | None) -> Check:
+    """No operation can create an experience or education entry, so one
+    whose id is not in the master is a hard failure -- catches a hand-edited
+    version YAML with an invented employer/degree independently of the patch
+    layer (provenance.replay already catches this too, but this check does
+    not depend on the recorded patches replaying)."""
+    if master_index is None:
+        return _chk("structure.unknown_entry", "not_available", "critical", "FACTUAL", "provenance",
+                    None, None, "No master index supplied.")
+    bad = []
+    for section in ("experience", "education"):
+        for i, entry in enumerate(doc.get(section) or []):
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("id") or f"{section}[{i}]"
+            if entry.get("id") not in master_index:
+                bad.append(eid)
+    return _chk("structure.unknown_entry", "fail" if bad else "pass", "critical", "FACTUAL", "provenance",
+                bad, [], f"{len(bad)} experience/education entry(ies) do not exist in the master: "
+                f"{_list_ids(bad)}." if bad else "")
+
+
 def _check_unknown_jd(doc: dict) -> Check:
     meta = doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {}
     reqs = meta.get("unknown_jd_requirements") or []
@@ -213,5 +271,7 @@ def check_structure(doc: dict, contract: dict, kind: str, master_index: dict | N
         _check_order(doc, contract),
         _check_headings(contract),
         *_check_provenance(doc, master_index, evidence),
+        _check_new_entry_provenance(doc, master_index),
+        _check_unknown_entry(doc, master_index),
         _check_unknown_jd(doc),
     ]

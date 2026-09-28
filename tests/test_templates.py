@@ -11,7 +11,8 @@ from lib.errors import ResumeTailorError
 from lib.schemas import TemplateContract
 
 EXPECTED_IDS = {"full-stack-modern", "classic-minimalist", "student-achievements",
-                "generic-minimal", "metrics-driven"}
+                "generic-minimal", "metrics-driven", "awesome-cv-resume",
+                "deedy-cv", "latexcv-two-column"}
 EXPERIMENTAL = sorted(EXPECTED_IDS - {"classic-minimalist"})
 
 # JDs that the unrestricted recommender maps to experimental templates.
@@ -40,7 +41,7 @@ def test_only_classic_is_supported_and_rendered():
     assert set(templates.RENDERERS) == {"classic-minimalist"}
     by_id = {t["id"]: t for t in templates.list_templates()}
     assert by_id["classic-minimalist"]["status"] == "supported"
-    assert by_id["classic-minimalist"]["version"] == "1.1.0"
+    assert by_id["classic-minimalist"]["version"] == "1.2.0"
     assert by_id["classic-minimalist"]["has_renderer"] is True
     for tid in EXPERIMENTAL:
         assert by_id[tid]["status"] == "experimental"
@@ -76,7 +77,7 @@ def test_explicit_unknown_for_tailoring_rejected(legacy_master):
 
 def test_classic_resolves_releasable():
     assert templates.resolve_template("classic-minimalist") == {
-        "id": "classic-minimalist", "status": "supported", "version": "1.1.0",
+        "id": "classic-minimalist", "status": "supported", "version": "1.2.0",
         "has_renderer": True, "releasable": True,
     }
     assert templates.is_releasable("classic-minimalist") is True
@@ -149,7 +150,7 @@ def test_explicit_experimental_returned_unchanged(tid, legacy_master):
 
 
 def test_explicit_classic_returned(legacy_master):
-    assert templates.resolve_for_tailoring("classic-minimalist", legacy_master, None) == ("classic-minimalist", "1.1.0")
+    assert templates.resolve_for_tailoring("classic-minimalist", legacy_master, None) == ("classic-minimalist", "1.2.0")
 
 
 # --- contracts ---------------------------------------------------------------

@@ -8,7 +8,7 @@ import pytest
 
 from lib.ids import normalize_master
 from lib.latex import render_latex
-from lib.validators.format_tex import check_tex
+from lib.validators.format_tex import ALL_CHECK_IDS, check_tex
 from tests.conftest import SYNTHETIC_LEGACY_MASTER
 from tests.test_validators_structure import CONTRACT
 
@@ -27,7 +27,13 @@ def _run(tex, contract=CONTRACT):
 
 ALL_IDS = {"template.page_size", "template.base_font_size", "template.margins", "template.margin_floor",
            "template.body_font_size", "template.body_font_floor", "template.forbidden_structures",
-           "template.columns", "template.font_family"}
+           "template.columns", "template.font_family", "template.name_font_size", "template.heading_font_size",
+           "template.heading_style", "template.spacing", "template.bullet_style", "template.link_style"}
+
+
+def test_all_check_ids_are_emitted(tex):
+    checks, _ = _run(tex)
+    assert set(checks) == set(ALL_CHECK_IDS) == ALL_IDS
 
 
 def test_real_renderer_output_passes(tex):
@@ -83,6 +89,34 @@ def test_multicols_fails(tex):
     assert checks["template.columns"].status == "fail" and inferred["columns"] == 2
 
 
+@pytest.mark.parametrize("env", ["minipage", "textblock", "tikzpicture", "wrapfigure", "longtable"])
+def test_forbidden_envs_fail(tex, env):
+    t = tex.replace(r"\begin{document}", f"\\begin{{document}}\n\\begin{{{env}}}{{1in}}x\\end{{{env}}}", 1)
+    checks, inferred = _run(t)
+    assert checks["template.forbidden_structures"].status == "fail"
+    assert env in inferred["forbidden"]
+
+
+@pytest.mark.parametrize("cmd", ["parbox", "fbox", "framebox", "colorbox", "fcolorbox"])
+def test_forbidden_cmds_fail(tex, cmd):
+    t = tex.replace(r"\begin{document}", f"\\begin{{document}}\n\\{cmd}{{x}}{{y}}", 1)
+    checks, inferred = _run(t)
+    assert checks["template.forbidden_structures"].status == "fail"
+    assert cmd in inferred["forbidden"]
+
+
+def test_twocolumn_as_class_option_fails(tex):
+    t = tex.replace("[letterpaper,11pt]", "[letterpaper,11pt,twocolumn]", 1)
+    checks, inferred = _run(t)
+    assert checks["template.columns"].status == "fail" and inferred["columns"] == 2
+
+
+def test_twocolumn_as_command_fails(tex):
+    t = tex.replace(r"\begin{document}", "\\begin{document}\n\\twocolumn\n", 1)
+    checks, inferred = _run(t)
+    assert checks["template.columns"].status == "fail" and inferred["columns"] == 2
+
+
 def test_includegraphics_fails(tex):
     t = tex.replace(r"\begin{document}", "\\begin{document}\n\\includegraphics{photo.png}", 1)
     c, inferred = _run(t)
@@ -109,6 +143,95 @@ def test_scriptsize_body_items_fail_floor(tex):
 def test_commented_out_structures_are_ignored(tex):
     t = tex.replace(r"\begin{document}", "\\begin{document}\n% \\includegraphics{photo.png}", 1)
     assert _run(t)[0]["template.forbidden_structures"].status == "pass"
+
+
+def test_layout_macro_whitelist_is_contract_driven(tex):
+    """With no whitelisted layout-only macros, the untouched renderer output
+    (which relies on resumeSubheading's internal tabularx) now fails --
+    LAYOUT_MACROS is contract-driven, not a hardcoded assumption."""
+    contract = copy.deepcopy(CONTRACT)
+    contract["latex"]["layout_only_macros"] = []
+    checks, inferred = _run(tex, contract)
+    assert checks["template.forbidden_structures"].status == "fail"
+    assert "tabularx" in inferred["forbidden"]
+
+
+def test_name_font_size_matches_huge(tex):
+    checks, inferred = _run(tex)
+    assert checks["template.name_font_size"].status == "pass"
+    assert inferred["name_font_pt"] == pytest.approx(20.74)
+
+
+def test_name_font_size_fails_when_header_size_switch_changes(tex):
+    t = tex.replace(r"\huge \scshape", r"\Large \scshape", 1)
+    checks, _ = _run(t)
+    assert checks["template.name_font_size"].status == "fail"
+
+
+def test_heading_font_size_fails_when_titleformat_size_switch_changes(tex):
+    t = tex.replace(r"\raggedright\large", r"\raggedright\normalsize", 1)
+    checks, _ = _run(t)
+    assert checks["template.heading_font_size"].status == "fail"
+
+
+def test_heading_style_fails_missing_scshape(tex):
+    t = tex.replace(r"\bfseries\scshape", r"\bfseries", 1)
+    checks, _ = _run(t)
+    c = checks["template.heading_style"]
+    assert c.status == "fail" and "scshape" in c.message
+
+
+def test_heading_style_fails_missing_titlerule(tex):
+    t = tex.replace(r"\titlerule \vspace{2pt}", r"\vspace{2pt}", 1)
+    checks, _ = _run(t)
+    assert checks["template.heading_style"].status == "fail"
+
+
+def test_heading_style_not_available_for_unrecognized_style_string():
+    contract = copy.deepcopy(CONTRACT)
+    contract["formatting"]["heading_style"] = "some new style nobody wrote a rule for"
+    checks, _ = _run("\\documentclass[letterpaper,11pt]{article}\n\\begin{document}\\end{document}", contract)
+    assert checks["template.heading_style"].status == "not_available"
+
+
+def test_spacing_fails_on_changed_itemsep(tex):
+    t = tex.replace("itemsep=2pt", "itemsep=8pt", 1)
+    checks, _ = _run(t)
+    assert checks["template.spacing"].status == "fail"
+
+
+def test_spacing_fails_on_linespread(tex):
+    t = tex.replace(r"\begin{document}", "\\linespread{0.85}\n\\begin{document}", 1)
+    checks, _ = _run(t)
+    c = checks["template.spacing"]
+    assert c.status == "fail" and "linespread" in c.message.lower()
+
+
+def test_spacing_fails_on_onehalfspacing(tex):
+    t = tex.replace(r"\begin{document}", "\\onehalfspacing\n\\begin{document}", 1)
+    checks, _ = _run(t)
+    assert checks["template.spacing"].status == "fail"
+
+
+def test_bullet_style_fails_on_enumerate_body(tex):
+    t = tex.replace(r"\begin{itemize}[leftmargin=0.18in]", r"\begin{enumerate}[leftmargin=0.18in]", 1)
+    t = t.replace(r"\end{itemize}\vspace{6pt}", r"\end{enumerate}\vspace{6pt}", 1)
+    checks, inferred = _run(t)
+    assert checks["template.bullet_style"].status == "fail"
+    assert checks["template.bullet_style"].measurement["other"] == ["enumerate"]
+
+
+def test_link_style_fails_on_colorlinks(tex):
+    t = tex.replace(r"\usepackage[hidelinks]{hyperref}", r"\usepackage[colorlinks]{hyperref}", 1)
+    checks, _ = _run(t)
+    c = checks["template.link_style"]
+    assert c.status == "fail" and c.severity == "warning"
+
+
+def test_link_style_fails_missing_hidelinks(tex):
+    t = tex.replace(r"\usepackage[hidelinks]{hyperref}", r"\usepackage{hyperref}", 1)
+    checks, _ = _run(t)
+    assert checks["template.link_style"].status == "fail"
 
 
 def test_decorative_font_fails(tex):

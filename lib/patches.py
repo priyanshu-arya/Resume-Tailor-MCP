@@ -29,13 +29,16 @@ through `provenance_hook` (see `validate_and_apply` for the `ctx` contract).
 from __future__ import annotations
 
 import copy
+import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, get_args
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from lib import rules
 from lib.errors import ResumeTailorError
 from lib.ids import experience_category, index_blocks, project_category
+from lib.validators.provenance import extract_metrics as _extract_metrics
 from lib.schemas import (
     CLAIM_RANK,
     MASTER_PSEUDO_CATEGORIES,
@@ -43,6 +46,7 @@ from lib.schemas import (
     REPAIR_SAFE_OPERATIONS,
     SUMMARY_ID,
     AddBlock,
+    AddProjectEntry,
     AddSkillItem,
     DropBlock,
     Patch,
@@ -55,6 +59,17 @@ MAX_PATCHES = 200
 MAX_TEXT_LEN = 600
 MAX_SKILL_NAME_LEN = 60
 MAX_SKILL_CATEGORY_LEN = 60
+MAX_PROJECT_NAME_LEN = 120
+MAX_PROJECT_STACK_LEN = 200
+MAX_NEW_PROJECT_ENTRIES_PER_CALL = 3
+# Evidence categories that may back a brand-new project entry (spec 3.5):
+# professional is a downgrade (paid work presented under Projects, never
+# inflation); coursework is refused even though its Projects placement is
+# "limited" -- that governs wording inside a block, not conjuring a whole
+# structural entry.
+NEW_ENTRY_BACKING_CATEGORIES = ("professional", "internship", "personal_project", "academic")
+MAX_METADATA_KEYS = 5
+MAX_METADATA_SERIALIZED_CHARS = 200
 
 CONTENT_KEYS = ("name", "contact", "summary", "skills", "experience", "education", "projects", "certifications")
 REORDER_SECTIONS = ("experience", "projects", "education", "skills", "certifications")
@@ -69,7 +84,7 @@ _ENTRY_TYPES = {"experience": "experience", "projects": "project", "education": 
 _REPLACEABLE_TYPES = ("summary", "experience_bullet", "project_bullet", "education_bullet")
 
 _PATCH_LIST_ADAPTER = TypeAdapter(list[Patch])
-_PATCH_CLASSES = (ReplaceBlock, DropBlock, Reorder, AddBlock, AddSkillItem)
+_PATCH_CLASSES = (ReplaceBlock, DropBlock, Reorder, AddBlock, AddSkillItem, AddProjectEntry)
 
 
 # --------------------------------------------------------------------------
@@ -323,6 +338,60 @@ def _check_text(text: str) -> list[dict]:
     return []
 
 
+def _check_metadata(metadata: dict) -> list[dict]:
+    """Gap B (4.2): NewContent.metadata is attacker-controlled and is deep-copied
+    into the saved version and into provenance.replay's hash -- bound it so it
+    cannot smuggle an unbounded/nested payload."""
+    if not isinstance(metadata, dict):
+        return [_rej("patch.metadata_size", "metadata must be an object.")]
+    if len(metadata) > MAX_METADATA_KEYS:
+        return [_rej("patch.metadata_size", f"metadata may have at most {MAX_METADATA_KEYS} keys.")]
+    if any(isinstance(v, (dict, list)) for v in metadata.values()):
+        return [_rej("patch.metadata_size", "metadata values must be scalars (no nested objects/lists).")]
+    try:
+        serialized_len = len(json.dumps(metadata, ensure_ascii=True))
+    except (TypeError, ValueError):
+        return [_rej("patch.metadata_size", "metadata is not serializable.")]
+    if serialized_len > MAX_METADATA_SERIALIZED_CHARS:
+        return [_rej("patch.metadata_size",
+                     f"metadata must serialize to at most {MAX_METADATA_SERIALIZED_CHARS} characters.")]
+    return []
+
+
+def _is_familiarity_group(category: str) -> bool:
+    name = (category or "").casefold()
+    return any(marker in name for marker in rules.familiarity_markers())
+
+
+def _has_high_scope_verb(text: str) -> bool:
+    for family in rules.high_scope_families():
+        alternatives = "|".join(sorted((re.escape(f) for f in family), key=len, reverse=True))
+        if re.search(rf"(?<![A-Za-z])(?:{alternatives})(?![A-Za-z])", text or "", re.IGNORECASE):
+            return True
+    return False
+
+
+def _check_skill_group_category(category: str, group: dict | None) -> list[dict]:
+    """Gap A (4.2): a NEW skill-group category (no case-insensitive match to an
+    existing master group) is unvalidated free text with no provenance, rendered
+    verbatim as the bold label on the released page. An existing group's name is
+    left alone -- bespoke master group names are unaffected."""
+    if group is not None or _is_familiarity_group(category):
+        return []
+    allowed = {c.casefold() for c in rules.skill_group_categories()}
+    if category.casefold() not in allowed:
+        return [_rej("patch.skill_group_category",
+                     "A new skill-group category must be one of the reviewed categories "
+                     "(rules.skill_group_categories()) or a familiarity group.")]
+    problems = []
+    if _extract_metrics(category):
+        problems.append(_rej("patch.skill_group_category", "A new skill-group category must not contain a metric."))
+    if _has_high_scope_verb(category):
+        problems.append(_rej("patch.skill_group_category",
+                             "A new skill-group category must not contain a high-scope verb."))
+    return problems
+
+
 def _check_replace(p: ReplaceBlock, body: dict, state: dict, ctx: _Ctx):
     loc = _locate(body, p.target.id, state["summary_present"])
     if loc is None:
@@ -331,6 +400,7 @@ def _check_replace(p: ReplaceBlock, body: dict, state: dict, ctx: _Ctx):
         return [_rej("patch.replace_target_type",
                      f"Target {_short(p.target.id)} is a {loc['type']}; only the summary and bullets can be replaced.")], None
     rejections = _check_text(p.new_content.text)
+    rejections += _check_metadata(p.new_content.metadata)
     ref_rej, infos = _check_refs([r.model_dump() for r in p.new_content.source_refs], ctx)
     rejections += ref_rej
     return rejections, {"loc": loc, "infos": infos, "target_type": loc["type"], "target_section": loc["section"],
@@ -386,6 +456,7 @@ def _check_add_block(p: AddBlock, body: dict, state: dict, ctx: _Ctx):
         return [_rej("patch.add_parent_type",
                      f"Parent {_short(p.parent_id)} is a {loc['type']}; bullets can only be added to entries.")], None
     rejections = _check_text(p.new_content.text)
+    rejections += _check_metadata(p.new_content.metadata)
     ref_rej, infos = _check_refs([r.model_dump() for r in p.new_content.source_refs], ctx)
     rejections += ref_rej
     entry = loc["container"][loc["index"]]
@@ -406,11 +477,73 @@ def _check_add_skill(p: AddSkillItem, body: dict, state: dict, ctx: _Ctx):
     if group is not None and any(_norm(str(i.get("name", ""))) == _norm(p.name) for i in group.get("items") or []):
         rejections.append(_rej("patch.duplicate_skill",
                                f"Skill group {_short(group.get('id'))} already contains this skill."))
+    if p.category.strip():
+        rejections += _check_skill_group_category(p.category.strip(), group)
     ref_rej, infos = _check_refs([r.model_dump() for r in p.source_refs], ctx)
     rejections += ref_rej
     category = group.get("category") if group is not None else p.category.strip()
     return rejections, {"group": group, "infos": infos, "target_type": "skill_item", "target_section": "skills",
                         "text": p.name, "skill_group_category": category}
+
+
+def _check_add_project_entry(p: AddProjectEntry, body: dict, state: dict, ctx: _Ctx):
+    """Create a brand-new Projects entry. There is no `target`, so this can
+    never touch an existing entry (spec 3.5). Structural checks here; the
+    per-text provenance hook (placement/technology/metric/verb/scope) runs
+    separately, once per new piece of wording (the entry itself, plus each
+    bullet) via `_hook_ctxs`."""
+    rejections: list[dict] = []
+    name = p.name.strip()
+    if not name or len(name) > MAX_PROJECT_NAME_LEN:
+        rejections.append(_rej("patch.text_length",
+                               f"Project name must be non-empty and at most {MAX_PROJECT_NAME_LEN} characters."))
+    stack = (p.stack or "").strip() or None
+    if stack and len(stack) > MAX_PROJECT_STACK_LEN:
+        rejections.append(_rej("patch.text_length",
+                               f"Project stack must be at most {MAX_PROJECT_STACK_LEN} characters."))
+    if name and any(_norm(str(pr.get("name", ""))) == _norm(name) for pr in body["projects"]):
+        rejections.append(_rej("patch.duplicate_project", "A project with this name already exists."))
+
+    state["new_entry_count"] = state.get("new_entry_count", 0) + 1
+    if state["new_entry_count"] > MAX_NEW_PROJECT_ENTRIES_PER_CALL:
+        rejections.append(_rej("patch.too_many_new_entries",
+                               f"At most {MAX_NEW_PROJECT_ENTRIES_PER_CALL} new project entries are allowed "
+                               "per tailoring call."))
+
+    entry_text = " ".join(x for x in (name, stack) if x)
+    entry_ref_rej, entry_infos = _check_refs([r.model_dump() for r in p.source_refs], ctx)
+    rejections += entry_ref_rej
+
+    bullet_plans = []
+    for bullet in p.bullets:
+        rejections += _check_text(bullet.text)
+        rejections += _check_metadata(bullet.metadata)
+        b_ref_rej, b_infos = _check_refs([r.model_dump() for r in bullet.source_refs], ctx)
+        rejections += b_ref_rej
+        bullet_plans.append({"text": bullet.text, "infos": b_infos, "claim_strength": bullet.claim_strength,
+                             "source_refs": bullet.source_refs, "metadata": bullet.metadata})
+
+    entry_evidence = [r for r in entry_infos if r["type"] == "evidence"]
+    if not entry_evidence:
+        rejections.append(_rej("provenance.new_entry_requires_evidence",
+                               "A new project entry needs at least one evidence source ref covering the entry "
+                               "itself; a master ref alone is not enough."))
+    else:
+        bad_cat = sorted({r["category"] for r in entry_evidence if r["category"] not in NEW_ENTRY_BACKING_CATEGORIES})
+        if bad_cat:
+            rejections.append(_rej("provenance.new_entry_placement",
+                                   f"Evidence categor{'y' if len(bad_cat) == 1 else 'ies'} cannot back a new "
+                                   f"project entry: {', '.join(bad_cat)}."))
+        academic_cited = any(r["category"] == "academic" for r in entry_evidence)
+        academic_cited = academic_cited or any(
+            r["type"] == "evidence" and r["category"] == "academic" for bp in bullet_plans for r in bp["infos"])
+        if academic_cited and not p.academic:
+            rejections.append(_rej("provenance.project_academic_context",
+                                   "Academic evidence backs this entry; set academic=True to declare it."))
+
+    return rejections, {"name": name, "stack": stack, "entry_text": entry_text, "entry_infos": entry_infos,
+                        "entry_refs": p.source_refs, "entry_claim_strength": p.claim_strength,
+                        "academic": p.academic, "bullets": bullet_plans}
 
 
 _CHECKS = {
@@ -419,6 +552,7 @@ _CHECKS = {
     "reorder": _check_reorder,
     "add_block": _check_add_block,
     "add_skill_item": _check_add_skill,
+    "add_project_entry": _check_add_project_entry,
 }
 
 
@@ -489,17 +623,49 @@ def _apply_add_skill(p: AddSkillItem, plan: dict, body: dict, state: dict, repor
     return new_id
 
 
+def _apply_add_project(p: AddProjectEntry, plan: dict, body: dict, state: dict, report: dict) -> str:
+    entry_id = _next_id(body, "vp-")
+    entry = {"id": entry_id, "name": plan["name"], "stack": plan["stack"], "academic": plan["academic"],
+             "source_refs": [r.model_dump() for r in plan["entry_refs"]],
+             "claim_strength": _claim(plan["entry_claim_strength"], plan["entry_infos"]), "bullets": []}
+    # Append the entry BEFORE minting bullet IDs: _next_id scans the whole
+    # body, so minting all bullet IDs first (against a body that doesn't yet
+    # contain this entry or its earlier bullets) would give every bullet in
+    # this same patch the same "vb-NNN" id.
+    body["projects"].append(entry)
+    report["new_block_ids"].append(entry_id)
+    for bp in plan["bullets"]:
+        bullet_id = _next_id(body, "vb-")
+        entry["bullets"].append({"id": bullet_id, "text": bp["text"],
+                                 "source_refs": [r.model_dump() for r in bp["source_refs"]],
+                                 "claim_strength": _claim(bp["claim_strength"], bp["infos"]),
+                                 "metadata": copy.deepcopy(bp["metadata"])})
+        report["new_block_ids"].append(bullet_id)
+    report.setdefault("new_entry_ids", []).append(entry_id)
+    return entry_id
+
+
 _APPLY = {
     "replace_block": _apply_replace,
     "drop_block": _apply_drop,
     "reorder": _apply_reorder,
     "add_block": _apply_add_block,
     "add_skill_item": _apply_add_skill,
+    "add_project_entry": _apply_add_project,
 }
 
 # Operations that introduce new wording and therefore must cite sources and
 # go through the provenance hook.
-_CONTENT_OPERATIONS = ("replace_block", "add_block", "add_skill_item")
+_CONTENT_OPERATIONS = ("replace_block", "add_block", "add_skill_item", "add_project_entry")
+
+# Every operation the discriminated Patch union can carry. A future operation
+# missing from _APPLY crashes loudly (KeyError); one missing from
+# _CONTENT_OPERATIONS would silently skip the entire provenance hook instead --
+# that is the hazard this assertion closes (4.1).
+_OPERATIONS = frozenset(
+    op for cls in _PATCH_CLASSES for op in get_args(cls.model_fields["operation"].annotation)
+)
+assert set(_CHECKS) == set(_APPLY) == _OPERATIONS, "patch operation tables are out of sync"
 
 
 def _entry_category(section: str, entry: dict | None) -> str | None:
@@ -534,6 +700,32 @@ def _hook_ctx(index: int, patch, plan: dict) -> dict:
         "claim_strength": _claim(explicit, plan["infos"]),
         "ref_infos": copy.deepcopy(plan["infos"]),
     }
+
+
+def _hook_ctxs(index: int, patch, plan: dict) -> list[dict]:
+    """One ctx per piece of NEW wording. Every content operation introduces
+    exactly one; add_project_entry introduces several (the entry itself --
+    name + stack -- then one per bullet), so it needs its own ctx per piece
+    instead of the single ctx _hook_ctx builds."""
+    if patch.operation != "add_project_entry":
+        return [_hook_ctx(index, patch, plan)]
+    parent_category = project_category({"academic": plan["academic"]})
+    ctxs = [{
+        "patch_index": index, "operation": patch.operation, "target_type": "project",
+        "target_section": "projects", "skill_group_category": None, "parent_category": parent_category,
+        "text": plan["entry_text"], "source_refs": [r.model_dump() for r in plan["entry_refs"]],
+        "claim_strength": _claim(plan["entry_claim_strength"], plan["entry_infos"]),
+        "ref_infos": copy.deepcopy(plan["entry_infos"]),
+    }]
+    for bp in plan["bullets"]:
+        ctxs.append({
+            "patch_index": index, "operation": patch.operation, "target_type": "project_bullet",
+            "target_section": "projects", "skill_group_category": None, "parent_category": parent_category,
+            "text": bp["text"], "source_refs": [r.model_dump() for r in bp["source_refs"]],
+            "claim_strength": _claim(bp["claim_strength"], bp["infos"]),
+            "ref_infos": copy.deepcopy(bp["infos"]),
+        })
+    return ctxs
 
 
 # --------------------------------------------------------------------------
@@ -576,7 +768,8 @@ def validate_and_apply(master: dict, patches, *, workflow_id: str,
     ctx = _Ctx(master, workflow_id, evidence)
     body = initial_body(master)
     state = {"summary_present": True, "summary_refs": _self_ref(SUMMARY_ID), "summary_claim": None}
-    report: dict[str, Any] = {"applied": [], "new_block_ids": [], "changed_block_ids": [], "dropped_block_ids": []}
+    report: dict[str, Any] = {"applied": [], "new_block_ids": [], "changed_block_ids": [], "dropped_block_ids": [],
+                              "new_entry_ids": []}
     rejections: list[dict] = []
 
     for index, patch in enumerate(parsed):
@@ -591,7 +784,8 @@ def validate_and_apply(master: dict, patches, *, workflow_id: str,
         problems, plan = _CHECKS[op](patch, body, state, ctx)
         if not problems and provenance_hook is not None and op in _CONTENT_OPERATIONS:
             problems = [_rej(str(r.get("rule", "provenance.hook")), str(r.get("message", "")))
-                        for r in (provenance_hook(_hook_ctx(index, patch, plan)) or [])]
+                        for hctx in _hook_ctxs(index, patch, plan)
+                        for r in (provenance_hook(hctx) or [])]
         if problems:
             reject(problems)
             continue
@@ -607,5 +801,6 @@ def validate_and_apply(master: dict, patches, *, workflow_id: str,
     remaining = _all_body_ids(body) | ({SUMMARY_ID} if state["summary_present"] else set())
     report["new_block_ids"] = [i for i in report["new_block_ids"] if i in remaining]
     report["changed_block_ids"] = list(dict.fromkeys(i for i in report["changed_block_ids"] if i in remaining))
+    report["new_entry_ids"] = [i for i in report["new_entry_ids"] if i in remaining]
     report["summary"] = {"source_refs": state["summary_refs"], "claim_strength": state["summary_claim"]}
     return body, report

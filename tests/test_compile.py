@@ -9,14 +9,9 @@ from lib.errors import ResumeTailorError
 from lib.ids import normalize_master
 from lib.latex import render_latex
 from lib.locking import sha256_file, sha256_text
+from tests.conftest import needs_tectonic
 
-try:
-    export._tectonic_path()
-    _HAVE_TECTONIC = True
-except ResumeTailorError:
-    _HAVE_TECTONIC = False
-
-pytestmark = pytest.mark.skipif(not _HAVE_TECTONIC, reason="tectonic not available")
+pytestmark = needs_tectonic
 
 
 @pytest.fixture(scope="module")
@@ -70,6 +65,23 @@ def test_to_pdf_still_works(tmp_path, synthetic_doc):
     assert out.exists() and out.read_bytes()[:5] == b"%PDF-"
     tex_path = out.with_suffix(".tex")
     assert tex_path.read_text(encoding="utf-8") == export.to_tex(synthetic_doc, "classic-minimalist")
+
+
+def test_added_project_entry_stack_renders_without_href(synthetic_doc):
+    """3.5: a brand-new project entry (add_project_entry) has no `github`
+    field -- the renderer must not fabricate a link for it, only render the
+    stack as plain text (lib/links.py only hyperlinks a project name when
+    `github` is set)."""
+    doc = {**synthetic_doc, "projects": synthetic_doc["projects"] + [{
+        "id": "vp-001", "name": "K8s Operator", "stack": "Kubernetes", "academic": False,
+        "source_refs": [{"type": "evidence", "id": "ev-k8s"}], "claim_strength": "personal_project",
+        "bullets": [{"id": "vb-001", "text": "Built a Kubernetes operator to automate deployments.",
+                    "source_refs": [{"type": "evidence", "id": "ev-k8s"}],
+                    "claim_strength": "personal_project", "metadata": {}}],
+    }]}
+    tex = render_latex(doc, "classic-minimalist")
+    assert "K8s Operator" in tex
+    assert "\\href" not in tex.split("K8s Operator")[1].split("\\\\")[0]
 
 
 def test_overfull_count_uses_final_pass_only(tmp_path):

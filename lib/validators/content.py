@@ -28,6 +28,20 @@ from lib.schemas import SUMMARY_ID, Check
 SOURCE = "etiquette"
 CATEGORY = "FORMAT"
 
+# Every check this module can emit, in report order.
+ALL_CHECK_IDS = (
+    "content.contact_email_phone",
+    "content.required_sections",
+    "content.summary_length",
+    "content.generic_summary",
+    "content.bullet_length",
+    "content.banned_opener",
+    "content.quantified_ratio",
+    "content.bullets_per_role",
+    "content.dates_present",
+    "content.personal_identifiers",
+)
+
 # --------------------------------------------------------------------------
 # Rule constants. Where resume_etiquette.yaml has a machine-readable list it
 # is loaded (see weak_openers()); the values below are prose in the YAML, so

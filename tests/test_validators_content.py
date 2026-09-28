@@ -174,6 +174,51 @@ def test_messages_never_quote_resume_text():
         assert SENTINEL not in repr(c.measurement)
 
 
+def test_check_content_never_emits_provenance_or_factual():
+    """Layering guard (Phase 6): fabrication/unsupported-tech/bad-placement
+    are lib/validators/provenance.py's job, not content.py's. Every check
+    this module emits must stay in its own lane."""
+    doc = _doc()
+    doc["contact"]["dob"] = "x"
+    doc["experience"][0]["bullets"][0]["text"] = "Responsible for 18 endpoints."
+    checks = check_content(doc)
+    assert checks  # sanity: this doc actually triggers some checks
+    for c in checks:
+        assert not c.id.startswith("provenance.")
+        assert c.category != "FACTUAL"
+        assert c.category == "FORMAT"
+        assert c.source == "etiquette"
+
+
+@pytest.mark.parametrize("opener", weak_openers())
+def test_banned_opener_covers_every_weak_opener(opener):
+    doc = _doc()
+    doc["experience"][0]["bullets"][0]["text"] = f"{opener.capitalize()} several backend services."
+    c = _by_id(check_content(doc))["content.banned_opener"]
+    assert c.status == "fail"
+    assert "exp-001-b01" in c.measurement["bullets"]
+
+
+def test_every_content_check_id_is_emitted():
+    from lib.validators.content import ALL_CHECK_IDS
+    doc = _doc()
+    doc["contact"]["dob"] = "x"
+    assert {c.id for c in check_content(doc)} == set(ALL_CHECK_IDS)
+
+
+def test_rules_unavailable_fails_closed(monkeypatch, tmp_path):
+    """A missing etiquette file must surface as RULES_UNAVAILABLE all the way
+    through check_content -- never a silently skipped rule."""
+    from lib.errors import ResumeTailorError
+    import lib.validators.content as content_mod
+    monkeypatch.setattr(content_mod, "ETIQUETTE_PATH", tmp_path / "does-not-exist.yaml")
+    content_mod._cache["openers"] = None
+    content_mod._cache["mtime"] = None
+    with pytest.raises(ResumeTailorError) as ei:
+        check_content(_doc())
+    assert ei.value.code == "RULES_UNAVAILABLE"
+
+
 def test_summarize():
     doc = _doc()
     doc["contact"]["dob"] = "x"  # error

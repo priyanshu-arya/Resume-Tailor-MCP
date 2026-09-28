@@ -98,11 +98,16 @@ def load_master(kind: str = "resume", ws: Workspace | None = None) -> tuple[dict
 def require_master(kind: str = "resume", ws: Workspace | None = None) -> tuple[dict, str]:
     doc, h = load_master(kind, ws)
     if doc is None:
+        ws = ws or get_workspace()
         raise ResumeTailorError(
             "MASTER_NOT_FOUND",
-            f"No master {kind} in this workspace yet. Create one with set_master_resume "
-            f"(or the create-master-file skill), or migrate_legacy_data.",
-            details={"kind": kind},
+            f"No master {kind} in this workspace ({ws.id}). Tailoring cannot proceed: the master "
+            f"is the only source of truth. Do NOT reconstruct it from memory, from this "
+            f"conversation, from a previous tailored version, or from another workspace. Ask the "
+            f"user for one folder holding their existing {kind} and call "
+            f"discover_masters(folder), or build one with the create-master-file skill. If their "
+            f"data may be in a different workspace, call list_workspaces and ask -- never guess.",
+            details={"kind": kind, "workspace_id": ws.id},
         )
     return doc, h
 
@@ -143,10 +148,41 @@ def save_master(kind: str, doc: dict, expected_hash: str | None, reason: str,
         new_hash = master_hash(doc)
         history_path = ws.master_dir / "history.yaml"
         history = yaml_load_file(history_path) or []
-        history.append({"at": utc_now_iso(), "kind": kind, "reason": reason,
-                        "previous_hash": current_hash, "new_hash": new_hash})
+        entry = {"at": utc_now_iso(), "kind": kind, "reason": reason,
+                "previous_hash": current_hash, "new_hash": new_hash}
+        imported = (doc.get("metadata") or {}).get("imported")
+        if isinstance(imported, dict):
+            # the import TIME lives here, not in metadata.imported itself --
+            # metadata is inside sha256_of(doc), so a timestamp there would
+            # make the preview/confirm protocol's proposed_hash unmatchable
+            # on every confirm (see docs/spec-map.md D6 / lib.discovery).
+            entry["source_filename"] = imported.get("source_filename")
+            entry["source_folder_name"] = imported.get("source_folder_name")
+            entry["source_folder_hash"] = imported.get("source_folder_hash")
+            entry["source_hash"] = imported.get("source_hash")
+        history.append(entry)
         atomic_write_yaml(history_path, history)
     return new_hash
+
+
+def read_master_history(kind: str = "resume", limit: int = 20, ws: Workspace | None = None) -> list[dict]:
+    """Newest-first write history for one master kind: when it changed, why,
+    the hash before and after, and -- for imports -- the source filename,
+    folder name/hash and file hash. Contains no resume content, so it is
+    safe to show the user verbatim (R-USER-11).
+
+    Read-only and lock-free by design: save_master writes history.yaml from
+    INSIDE workspace_lock, so this must never try to take that lock too."""
+    validate_kind(kind)
+    ws = ws or get_workspace()
+    limit = max(1, min(int(limit or 20), 500))
+    history_path = ws.master_dir / "history.yaml"
+    history = yaml_load_file(history_path)
+    if not isinstance(history, list):
+        return []
+    rows = [h for h in history if isinstance(h, dict) and h.get("kind") == kind]
+    rows.reverse()
+    return rows[:limit]
 
 
 # --------------------------------------------------------------------------

@@ -92,10 +92,38 @@ def test_unknown_requirements_surfaced(analysis):
     assert any("hipaa" in p["term"].lower() for p in unknown_prompts)
 
 
+def test_prompts_have_order_total_and_decline_phrasing(analysis):
+    _ws, res = analysis
+    prompts = res["evidence_prompts"]
+    assert prompts, "expected at least one prompt for this JD"
+    assert res["ask_one_at_a_time"] is True
+    assert res["prompt_count"] == len(prompts)
+    totals = {p["total"] for p in prompts}
+    assert totals == {len(prompts)}
+    assert [p["order"] for p in prompts] == list(range(1, len(prompts) + 1))
+    for p in prompts:
+        assert p["decline_phrasing"] == f"I will not add {p['term']} because no evidence was provided."
+        assert p["not_added_phrasing"] == p["decline_phrasing"]
+
+
+def test_statement_on_category_none_save(wf):
+    ws, wid = wf
+    res = ev.save_evidence(wid, "Kubernetes", "none", confirmed=True, ws=ws)
+    assert res["statement"] == "I will not add Kubernetes because no evidence was provided."
+    # a non-none save carries no statement
+    res2 = ev.save_evidence(wid, "fastapi", "academic", "Built a thesis API", confirmed=True, ws=ws)
+    assert "statement" not in res2
+
+    # the dedupe/reuse path also carries the statement
+    res3 = ev.save_evidence(wid, "Kubernetes", "none", confirmed=True, ws=ws)
+    assert res3["statement"] == "I will not add Kubernetes because no evidence was provided."
+
+
 def test_result_shape_and_no_jd_text(analysis):
     _ws, res = analysis
     assert set(res) == {"ok", "workflow_id", "source", "confirmed", "weak", "missing",
-                        "priority_missing", "unknown_requirements", "evidence_prompts",
+                        "priority_missing", "unknown_requirements", "requirements", "status_counts",
+                        "evidence_prompts", "prompts_truncated", "ask_one_at_a_time", "prompt_count",
                         "match_score", "ats_visible_score"}
     assert res["source"] == "workspace master resume"
     assert "HIPAA compliance\nNice" not in repr(res)
@@ -243,7 +271,7 @@ def test_stored_record_fields(wf):
     eid = res["evidence"]["id"]
     on_disk = yaml.safe_load((ws.evidence_dir / wid / f"{eid}.yaml").read_text())
     assert set(on_disk) == {"id", "workflow_id", "workspace_id", "term", "category", "evidence_text",
-                            "confirmed", "metrics", "created_at", "term_display"}
+                            "confirmed", "metrics", "created_at", "term_display", "prompt_reason"}
     assert on_disk["workspace_id"] == ws.id and on_disk["confirmed"] is True
 
 

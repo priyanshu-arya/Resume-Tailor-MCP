@@ -134,6 +134,220 @@ def test_config_with_python_tag_does_not_execute(rt_home, tmp_path):
 
 
 # --------------------------------------------------------------------------
+# Multi-workspace: list / select / switch (R-USER-14, R-USER-15)
+# --------------------------------------------------------------------------
+
+def test_list_workspaces_empty_home(rt_home):
+    r = wsmod.list_workspaces()
+    assert r == {"workspaces": [], "active_workspace_id": None, "count": 0, "truncated": False,
+                "note": r["note"]}
+
+
+def test_list_workspaces_marks_active(workspace):
+    r = wsmod.list_workspaces()
+    assert r["count"] == 1
+    assert r["active_workspace_id"] == workspace.id
+    row = r["workspaces"][0]
+    assert row["workspace_id"] == workspace.id
+    assert row["active"] is True
+    assert row["masters_present"] == {"resume": False, "cv": False}
+    assert row["id_format_ok"] is True
+
+
+def test_list_workspaces_skips_symlinked_entry(workspace, rt_home):
+    real = rt_home / "workspaces" / "RT-DEADBEEF"
+    real.mkdir(parents=True)
+    link = rt_home / "workspaces" / "RT-C0FFEE00"
+    link.symlink_to(real, target_is_directory=True)
+    ids = wsmod.existing_workspace_ids()
+    assert "RT-DEADBEEF" in ids
+    assert "RT-C0FFEE00" not in ids
+
+
+def test_list_workspaces_skips_invalid_names(workspace, rt_home):
+    # ".hidden" fails validate_id (must start with an alnum), so a directory
+    # with that name must never become a selectable workspace id.
+    bad_dir = rt_home / "workspaces" / ".hidden"
+    bad_dir.mkdir(parents=True)
+    ids = wsmod.existing_workspace_ids()
+    assert ".hidden" not in ids
+    assert workspace.id in ids
+
+
+def test_select_workspace_switches_binding(two_workspaces):
+    id_a, id_b = two_workspaces
+    assert wsmod.get_workspace().id == id_b  # b is active per the fixture
+    r = wsmod.select_workspace(id_a)
+    assert r["switched"] is True
+    assert r["previous_workspace_id"] == id_b
+    assert wsmod.get_workspace().id == id_a
+    # master saved in A is reachable again after switching back
+    assert storage.load_master("resume")[0] is not None
+
+
+def test_select_workspace_logs_the_switch_in_both_workspaces(two_workspaces):
+    """The destination side is logged by server.py's generic post-call audit
+    hook (config.yaml has already moved by the time it runs, so ws=None
+    there resolves to the new workspace); the source side has no such hook
+    once the call returns, so lib.workspace.select_workspace logs it
+    directly, from inside the call, into the workspace being LEFT. Going
+    through server.select_workspace (as a real MCP call would) exercises
+    both halves together."""
+    import json
+    import server as _server
+    id_a, id_b = two_workspaces  # b is active
+    _server.select_workspace(id_a)
+
+    def last_event(wid):
+        ws = wsmod._workspace_from_id(wid)
+        path = ws.monitoring_dir / "audit.jsonl"
+        lines = path.read_text().splitlines() if path.exists() else []
+        return json.loads(lines[-1]) if lines else None
+
+    ev_a = last_event(id_a)  # destination: gets it from the generic server-level hook
+    ev_b = last_event(id_b)  # source: gets it from select_workspace itself
+
+    assert ev_a is not None and ev_a["event"] == "workspace_switched"
+    assert ev_a["workspace_id"] == id_a
+    assert ev_a.get("from_workspace_id") == id_b
+
+    assert ev_b is not None and ev_b["event"] == "workspace_switched"
+    assert ev_b["workspace_id"] == id_b
+    assert ev_b.get("to_workspace_id") == id_a
+
+
+def test_select_workspace_with_no_prior_binding_is_not_a_switch(two_workspaces, rt_home):
+    # recovering from an ambiguous/missing binding (no active_workspace_id at
+    # all) is a first activation, not a switch -- there is no "from" side
+    id_a, id_b = two_workspaces
+    wsmod.config_path().unlink()
+    r = wsmod.select_workspace(id_a)
+    assert r["switched"] is False
+    assert r["previous_workspace_id"] is None
+
+
+def test_select_workspace_missing_dir_is_not_found(workspace):
+    with pytest.raises(ResumeTailorError) as ei:
+        wsmod.select_workspace("RT-DEADBEEF")
+    assert _code(ei) == "WORKSPACE_NOT_FOUND"
+    # the binding is untouched
+    assert wsmod.get_workspace().id == workspace.id
+
+
+@pytest.mark.parametrize("bad", BAD_IDS, ids=repr)
+def test_select_workspace_rejects_traversal_ids(workspace, bad):
+    with pytest.raises(ResumeTailorError) as ei:
+        wsmod.select_workspace(bad)
+    assert _code(ei) in ("INVALID_ID", "PATH_TRAVERSAL")
+
+
+def test_select_workspace_creates_no_workspace(workspace, rt_home):
+    before = set((rt_home / "workspaces").iterdir())
+    with pytest.raises(ResumeTailorError):
+        wsmod.select_workspace("RT-DEADBEEF")
+    after = set((rt_home / "workspaces").iterdir())
+    assert before == after
+
+
+def test_create_new_makes_second_workspace_and_binds(workspace):
+    first_id = workspace.id
+    r = wsmod.initialize_workspace(create_new=True, label="second one!!")
+    assert r["created"] is True
+    assert r["workspace_id"] != first_id
+    assert wsmod.get_workspace().id == r["workspace_id"]
+    row = next(w for w in wsmod.list_workspaces()["workspaces"] if w["workspace_id"] == r["workspace_id"])
+    assert row["label"] == "second-one"  # slugified
+
+
+def test_default_init_never_makes_second_workspace(workspace):
+    first_id = workspace.id
+    for _ in range(3):
+        r = wsmod.initialize_workspace()
+        assert r["created"] is False
+        assert r["workspace_id"] == first_id
+    ids = wsmod.existing_workspace_ids()
+    assert ids == [first_id]
+
+
+def test_create_new_refused_when_bound_workspace_missing(workspace):
+    import shutil
+    shutil.rmtree(workspace.root)
+    with pytest.raises(ResumeTailorError) as ei:
+        wsmod.initialize_workspace(create_new=True)
+    assert _code(ei) == "WORKSPACE_NOT_INITIALIZED"
+    assert wsmod.existing_workspace_ids() == []
+
+
+def test_missing_config_with_existing_workspaces_is_ambiguous(master):
+    """Regression for defect D-1: deleting config.yaml used to silently mint
+    a brand-new empty workspace and orphan the master that was already
+    there."""
+    ws, doc, h = master
+    wsmod.config_path().unlink()
+    with pytest.raises(ResumeTailorError) as ei:
+        wsmod.get_workspace()
+    assert _code(ei) == "WORKSPACE_AMBIGUOUS"
+    assert ei.value.details["available_workspace_ids"] == [ws.id]
+    with pytest.raises(ResumeTailorError) as ei2:
+        wsmod.initialize_workspace()
+    assert _code(ei2) == "WORKSPACE_AMBIGUOUS"
+    # still exactly one workspace on disk -- nothing new was minted
+    assert wsmod.existing_workspace_ids() == [ws.id]
+    # recovery: explicit select brings the master back
+    wsmod.select_workspace(ws.id)
+    assert storage.load_master("resume", wsmod.get_workspace()) == (doc, h)
+
+
+def test_ambiguous_does_not_create_anything(master, rt_home):
+    ws, doc, h = master
+    wsmod.config_path().unlink()
+    before = {p: p.stat().st_mtime_ns for p in rt_home.rglob("*") if p.is_file()}
+    for _ in range(2):
+        with pytest.raises(ResumeTailorError):
+            wsmod.get_workspace()
+        with pytest.raises(ResumeTailorError):
+            wsmod.initialize_workspace()
+    after = {p: p.stat().st_mtime_ns for p in rt_home.rglob("*") if p.is_file()}
+    assert before == after
+    assert not wsmod.config_path().exists()
+
+
+def test_config_preserves_unknown_keys_across_select(two_workspaces, rt_home):
+    id_a, id_b = two_workspaces
+    config_path = wsmod.config_path()
+    from lib import safe_yaml
+    from lib.locking import atomic_write_yaml
+    cfg = safe_yaml.load_file(config_path)
+    cfg["a_future_field_this_version_does_not_know_about"] = "keep-me"
+    atomic_write_yaml(config_path, cfg)
+    wsmod.select_workspace(id_a)
+    cfg2 = safe_yaml.load_file(config_path)
+    assert cfg2["a_future_field_this_version_does_not_know_about"] == "keep-me"
+    assert cfg2["active_workspace_id"] == id_a
+
+
+def test_concurrent_select_does_not_lose_config(two_workspaces):
+    import threading
+    id_a, id_b = two_workspaces
+    errors = []
+
+    def flip(target):
+        try:
+            for _ in range(20):
+                wsmod.select_workspace(target)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    t1 = threading.Thread(target=flip, args=(id_a,))
+    t2 = threading.Thread(target=flip, args=(id_b,))
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    assert not errors
+    # config is still valid YAML naming one of the two ids -- no corruption/interleaving
+    assert wsmod.get_workspace().id in (id_a, id_b)
+
+
+# --------------------------------------------------------------------------
 # Isolation / location
 # --------------------------------------------------------------------------
 

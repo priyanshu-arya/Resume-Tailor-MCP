@@ -14,6 +14,14 @@ template. An explicit request for an experimental template resolves as-is
 
 Scoring is deterministic (no LLM call), mirroring the rest of this server's
 keyword/ATS tools.
+
+Building a new renderer is explicitly out of scope for this phase (spec
+§26-30, decision 5.2): `RENDERERS` stays a one-entry map and no stub
+renderers are added for the four experimental templates. Adding a renderer
+later means: a new render module, a *complete* contract (`contract_gaps`
+must return `[]`), `status: supported`, a reference PDF whose measured
+properties match the contract, and re-running the full Phase 6 negative-path
+validator suite against it before it can be released.
 """
 
 from __future__ import annotations
@@ -22,11 +30,13 @@ import re
 from pathlib import Path
 from typing import Callable
 
+from pydantic import ValidationError
+
 from lib import latex as _latex
 from lib import safe_yaml
 from lib.errors import ResumeTailorError
 from lib.keywords import extract_jd_keywords
-from lib.schemas import TemplateContract, TemplateStatus
+from lib.schemas import CONTRACT_REQUIREMENTS, TemplateContract, TemplateStatus, contract_gaps
 
 RESOURCES_DIR = Path(__file__).resolve().parent.parent / "resources" / "templates"
 TEMPLATES_PATH = RESOURCES_DIR / "templates.yaml"
@@ -83,11 +93,134 @@ def list_templates() -> list[dict]:
             "status": t.get("status", TemplateStatus.experimental.value),
             "version": t.get("version"),
             "has_renderer": t["id"] in RENDERERS,
+            "releasable": t.get("status") == TemplateStatus.supported.value and t["id"] in RENDERERS,
             "sections": t["layout"]["sections"],
             "best_for": t["best_for"]["notes"].strip(),
         }
         for t in _load_all()
     ]
+
+
+_ID_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_UNMEASURED_BLOCKS = ("page", "typography", "spacing", "limits", "formatting", "latex")
+
+
+def validate_registry() -> dict:
+    """Structural self-check of the whole registry (spec §29/5.4). Aggregates
+    every problem into a single TEMPLATE_REGISTRY_INVALID if any are found;
+    called by the registry test, not on every lookup (that would make every
+    tool call pay for a check the repo's own test suite already guards)."""
+    from lib.validators.structure import RENDERER_SECTION_ORDER
+
+    problems: list[str] = []
+    templates_list = _load_all()
+
+    ids = [t.get("id") for t in templates_list]
+    if len(ids) != len(set(ids)):
+        problems.append(f"duplicate template ids: {ids}")
+    for tid in ids:
+        if not isinstance(tid, str) or not _ID_RE.match(tid):
+            problems.append(f"{tid!r}: id is not slug-shaped")
+
+    for t in templates_list:
+        tid = t.get("id", "<unknown>")
+        status = t.get("status")
+        if status not in (s.value for s in TemplateStatus):
+            problems.append(f"{tid}: invalid status {status!r}")
+        version = t.get("version")
+        if not isinstance(version, str) or not _SEMVER_RE.match(version):
+            problems.append(f"{tid}: version {version!r} is not semver-ish")
+        source_file = t.get("source_file")
+        if not source_file or not (RESOURCES_DIR / source_file).exists():
+            problems.append(f"{tid}: source_file {source_file!r} does not exist")
+
+        supported = status == TemplateStatus.supported.value
+        if not supported:
+            for block in _UNMEASURED_BLOCKS:
+                if t.get(block) != "unknown":
+                    problems.append(f"{tid}: non-supported template's {block!r} block must be the "
+                                    "literal \"unknown\", not a guess")
+            continue
+
+        # --- supported-only rules ---
+        if tid not in RENDERERS:
+            problems.append(f"{tid}: status=supported but has no registered renderer")
+        gaps = contract_gaps(t)
+        if gaps:
+            problems.append(f"{tid}: supported contract has gaps: {gaps}")
+
+        layout = t.get("layout") if isinstance(t.get("layout"), dict) else {}
+        if layout.get("columns") != 1:
+            problems.append(f"{tid}: supported template must declare layout.columns == 1")
+        for flag in ("tables_allowed", "text_boxes_allowed", "graphics_allowed"):
+            if layout.get(flag) is not False:
+                problems.append(f"{tid}: supported template must declare layout.{flag} == False "
+                                "(the floor is absolute; a contract must not claim otherwise)")
+
+        sections = t.get("sections") if isinstance(t.get("sections"), dict) else {}
+        order = sections.get("order")
+        if order != layout.get("sections"):
+            problems.append(f"{tid}: sections.order must equal layout.sections")
+        headings = sections.get("headings")
+        if not isinstance(headings, dict) or set(headings) != set(order or []):
+            problems.append(f"{tid}: sections.headings must have exactly the keys in sections.order")
+        if isinstance(order, list):
+            known = [s for s in order if s in RENDERER_SECTION_ORDER]
+            if known != [s for s in RENDERER_SECTION_ORDER if s in known]:
+                problems.append(f"{tid}: sections.order {order} is not a subsequence of "
+                                f"{list(RENDERER_SECTION_ORDER)}")
+
+        page = t.get("page") if isinstance(t.get("page"), dict) else {}
+        margins = page.get("margins_in") if isinstance(page.get("margins_in"), dict) else {}
+        for side, v in margins.items():
+            if not (0.5 <= v <= 1.0):
+                problems.append(f"{tid}: page.margins_in.{side}={v} outside 0.5-1.0")
+
+        typography = t.get("typography") if isinstance(t.get("typography"), dict) else {}
+        body_pt = (typography.get("body") or {}).get("size_pt")
+        if not isinstance(body_pt, (int, float)) or body_pt < 10:
+            problems.append(f"{tid}: typography.body.size_pt={body_pt} must be >= 10")
+        name_pt = (typography.get("name") or {}).get("size_pt")
+        if not isinstance(name_pt, (int, float)) or not (14 <= name_pt <= 24):
+            problems.append(f"{tid}: typography.name.size_pt={name_pt} must be 14-24")
+        heading_pt = (typography.get("heading") or {}).get("size_pt")
+        if not isinstance(heading_pt, (int, float)) or not (11 <= heading_pt <= 14):
+            problems.append(f"{tid}: typography.heading.size_pt={heading_pt} must be 11-14")
+
+        limits = t.get("limits") if isinstance(t.get("limits"), dict) else {}
+        min_p, max_p = limits.get("min_pages"), limits.get("max_pages")
+        if not (isinstance(min_p, int) and isinstance(max_p, int) and max_p >= min_p):
+            problems.append(f"{tid}: limits.max_pages ({max_p}) must be >= limits.min_pages ({min_p})")
+
+        latex_block = t.get("latex") if isinstance(t.get("latex"), dict) else {}
+        top = page.get("margins_in", {}).get("top")
+        bottom = page.get("margins_in", {}).get("bottom")
+        left = page.get("margins_in", {}).get("left")
+        right = page.get("margins_in", {}).get("right")
+        width_in, height_in = 8.5, 11.0
+        derived_top = 1 + latex_block.get("topmargin_adjust_in", 0)
+        derived_left = 1 + latex_block.get("side_margin_adjust_in", 0)
+        derived_bottom = height_in - derived_top - (9 + latex_block.get("textheight_adjust_in", 0))
+        derived_width = 6.5 + latex_block.get("textwidth_adjust_in", 0)
+        derived_right = width_in - derived_left - derived_width
+        for label, actual, derived in (("top", top, derived_top), ("bottom", bottom, derived_bottom),
+                                       ("left", left, derived_left), ("right", right, derived_right)):
+            if actual is None or abs(actual - derived) > 1e-6:
+                problems.append(f"{tid}: page.margins_in.{label}={actual} does not match latex.*_adjust_in "
+                                f"(derives {derived})")
+
+        enforcement = t.get("enforcement") if isinstance(t.get("enforcement"), dict) else {}
+        required_paths = {f"{block}.{k}" for block, keys in CONTRACT_REQUIREMENTS.items() for k in keys}
+        missing_enforcement = required_paths - set(enforcement)
+        if missing_enforcement:
+            problems.append(f"{tid}: enforcement map is missing entries for {sorted(missing_enforcement)}")
+
+    if problems:
+        raise ResumeTailorError("TEMPLATE_REGISTRY_INVALID",
+                                "Template registry failed self-validation: " + "; ".join(problems),
+                                details={"problems": problems})
+    return {"ok": True, "template_count": len(templates_list)}
 
 
 def get_template(template_id: str) -> dict | None:
@@ -98,9 +231,21 @@ def get_template(template_id: str) -> dict | None:
 
 
 def get_contract(template_id: str) -> dict:
-    """The template's §29 contract, validated through TemplateContract."""
+    """The template's §29 contract, validated through TemplateContract.
+
+    A malformed registry entry (e.g. `status: supported` hand-edited to a
+    hollowed-out contract) raises TEMPLATE_REGISTRY_INVALID -- a business
+    error the release gate can report to the user -- rather than a bare
+    pydantic ValidationError surfacing as an INTERNAL_ERROR."""
     tmpl = _lookup(template_id)
-    return TemplateContract.model_validate(tmpl).model_dump(mode="json")
+    try:
+        return TemplateContract.model_validate(tmpl).model_dump(mode="json")
+    except ValidationError as e:
+        raise ResumeTailorError(
+            "TEMPLATE_REGISTRY_INVALID",
+            f"Template {template_id!r}'s registry entry is invalid: {e}",
+            details={"template_id": template_id},
+        ) from e
 
 
 def resolve_template(template_id: str) -> dict:
@@ -270,7 +415,12 @@ def recommend_template(jd_text: str, resume: dict | None = None, supported_only:
             best_id = "generic-minimal"
 
     best = get_template(best_id)
-    return {
+    releasable = is_releasable(best_id)
+    # supported_only already restricted the candidate pool to releasable
+    # templates, so the pick is usable by construction -- compute it once
+    # here rather than recursing back into an unrestricted call.
+    usable = supported_only or releasable
+    result = {
         "recommended_template": best_id,
         "recommended_name": best["name"],
         "reasons": reasons_by_id[best_id],
@@ -278,5 +428,16 @@ def recommend_template(jd_text: str, resume: dict | None = None, supported_only:
         "all_scores": scores,
         "supported_only": supported_only,
         "status": best.get("status"),
-        "releasable": is_releasable(best_id),
+        "releasable": releasable,
+        "usable": usable,
     }
+    if not usable:
+        alt = recommend_template(jd_text, resume, supported_only=True)
+        result["releasable_alternative"] = alt["recommended_template"]
+        result["warning"] = (
+            f"{best_id!r} is experimental metadata with no production renderer: it cannot be rendered or "
+            f"released. Use {DEFAULT_TEMPLATE_ID!r} for an actual PDF. Nothing is substituted automatically.")
+        result["next_step"] = (
+            f"Call tailor_resume with template={alt['recommended_template']!r} (or template='auto'), "
+            f"not {best_id!r}.")
+    return result

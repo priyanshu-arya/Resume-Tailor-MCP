@@ -374,7 +374,7 @@ def _checked_path(file_path: str) -> Path:
     try:
         path = raw.resolve(strict=True)
         st = path.stat()
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):  # ValueError: e.g. an embedded NUL byte
         raise ResumeTailorError("IMPORT_UNSUPPORTED", f"File not found: {name}",
                                 details={"file": name}) from None
     if not stat.S_ISREG(st.st_mode):
