@@ -1,0 +1,208 @@
+%%------------------------------------------------------------------------------
+%%
+%%  CV In LaTeX
+%%  Author: Ethan Hu
+%%  Name: 'my_cv.tex'
+%%  Requires 'cv_template.cls'
+%%  Compiler: LuaLaTeX
+%%  Last Updated: 2021/08/16
+%%
+%%------------------------------------------------------------------------------
+
+%% USAGE:
+%%
+%% Requires 'cv_template.cls' in same directory
+%% On Overleaf, click Menu in top left, change Compiler to 'LuaLaTeX'
+%% Options below in key=value form, if value not specified value=(default)
+%%
+%% \documentclass[OPTIONS]{cv_template}
+%%
+%%  Example:
+%%      \documentclass[fit,fstyle=timesnewroman]{cv_template}
+
+%% ADDITIONAL OPTIONS:
+%%
+%% Margins:
+%%    marg: document margins for all sides
+%%      usage: marg=(0.5in),1in,1.5in
+%%
+%% Fonts:
+%%    fsize: font size
+%%      usage: fsize=(10pt),11pt,12pt
+%%
+%%  fstyle: font style, uses fontspec fonts
+%%      usage: fstyle=(cormorantgaramond),timesnewroman,calibri,roboto...
+%%
+%% Icons:
+%%    icon: toggle header icons
+%%      usage: icon=(true),false
+%%
+%% Page Auto-fit:
+%%    fit: toggle auto-fit text to page function
+%%      usage: fit=(false),true
+%%
+%%    frame: toggle visible box where text will be fit, requires 'fit' be on
+%%      usage: frame=(false),true
+%%
+%% Color Links:
+%%    link: toggle URL links colors
+%%      usage: link=(false),true
+
+\documentclass[11pt]{cv_template}
+
+%%--------------------------------------------------------------------
+%%  RESUME START
+%%--------------------------------------------------------------------
+
+\begin{document}
+
+%%----------------------------------------------------------
+%%  HEADER
+%%----------------------------------------------------------
+
+\begin{cv}
+
+\cvheader
+{First Last}
+{(123) 456-7890}
+{email@example.com}
+{github.com/name}
+{example.com}
+{linkedin.com/in/name}
+
+%%----------------------------------------------------------
+%%  EDUCATION
+%%----------------------------------------------------------
+
+\begin{cvsection}{Education}
+
+\begin{cvsubsection}
+{University Name}  {Graduate Year}
+{University Major} {City, State}
+
+\listitem[] Coursework -- Relevant course 1, Relevant course 2, Relevant course 3...
+
+\end{cvsubsection}
+
+\end{cvsection}
+
+%%----------------------------------------------------------
+%%  SKILLS
+%%----------------------------------------------------------
+
+\begin{cvsection}{Skills}
+
+\descitem [Skill Category 1] Skill 1, Skill 2, Skill 3, Skill 4, Skill 5...
+\descitem [Skill Category 2] Skill 1, Skill 2, Skill 3, Skill 4, Skill 5...
+\descitem [Skill Category 3] Skill 1, Skill 2, Skill 3, Skill 4, Skill 5...
+
+\end{cvsection}
+
+%%----------------------------------------------------------
+%%  EXPERIENCE
+%%----------------------------------------------------------
+
+\begin{cvsection}{Experience}
+
+%%------------------------------------------------
+
+\begin{cvsubsection}
+{Work Experience 1} {Start Date -- End Date}
+{Role or Position} {City, State}
+
+\listitem Designed app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs...
+\listitem Developed app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs...
+
+\end{cvsubsection}
+
+%%------------------------------------------------
+
+\begin{cvsubsection}
+{Work Experience 2} {Start Date -- End Date}
+{Role or Position} {City, State}
+
+\listitem Improved app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs...
+\listitem Enhanced app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs...
+
+\end{cvsubsection}
+
+%%------------------------------------------------
+
+\begin{cvsubsection}
+{Work Experience 3} {Start Date -- End Date}
+{Role or Position} {City, State}
+
+\listitem Established app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs...
+\listitem Initiated app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs...
+
+\end{cvsubsection}
+
+%%------------------------------------------------
+
+\end{cvsection}
+
+%%----------------------------------------------------------
+%%  PROJECTS
+%%----------------------------------------------------------
+
+\begin{cvsection}{Projects}
+
+%%------------------------------------------------
+
+\begin{cvsubsection}
+{Project 1} {Languages, Frameworks, Utilities Used} {Completion Date} {}
+
+\listitem Created app, program, website, script using languages, databases,   frameworks, utilities that increased efficiency, increased profit, reduced   costs ...
+\listitem Built app, program, website, script using languages, databases,     frameworks, utilities that increased efficiency, increased profit, reduced     costs ...
+
+\end{cvsubsection}
+
+%%------------------------------------------------
+
+\begin{cvsubsection}
+{Project 2} {Languages, Frameworks, Utilities Used} {Completion Date} {}
+
+\listitem Engineered app, program, website, script using languages,       databases, frameworks, utilities that increased efficiency, increased profit,  reduced costs ...
+\listitem Introduced app, program, website, script using languages,       databases, frameworks, utilities that increased efficiency, increased profit,  reduced costs ...
+
+\end{cvsubsection}
+
+%%------------------------------------------------
+
+\begin{cvsubsection}
+ {Project 3} {Languages, Frameworks, Utilities Used} {Completion Date} {}
+
+\listitem Pioneered app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs ...
+\listitem Devised app, program, website, script using languages, databases, frameworks, utilities that increased efficiency, increased profit, reduced costs ...
+
+\end{cvsubsection}
+
+%%------------------------------------------------
+
+\end{cvsection}
+
+%%----------------------------------------------------------
+%%  CUSTOM
+%%----------------------------------------------------------
+
+% \begin{cvsection}{Custom}
+
+% \begin{cvsubsection}
+% {Custom Subheader} {Custom Date}
+% {Custom Sub-subheader} {Custom Location}
+
+% \listitem[] Custom Info
+
+% \end{cvsubsection}
+
+% \end{cvsection}
+
+%%----------------------------------------------------------
+
+\end{cv}
+
+%%--------------------------------------------------------------------
+
+\end{document}
+
+%%------------------------------------------------------------------------------

@@ -32,10 +32,25 @@ Anything it can't confidently place goes into an "unparsed" field on
 the returned structure so you don't silently lose content -- check
 that field after a first import and move things by hand in the YAML
 if needed.
+
+Imported files are untrusted: parse_resume_file checks that the path is a
+regular file with an allowed extension and a bounded size, requires UTF-8
+for text formats, caps the extracted text, and never executes or evaluates
+anything. Failures are ResumeTailorError codes whose messages name only the
+file's basename, never its contents.
 """
 
 import re
+import stat
 from pathlib import Path
+
+from lib.errors import ResumeTailorError
+
+# Imports are untrusted input (spec §9, §66): cap the file size before
+# reading, and cap the extracted text before parsing it.
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_EXTRACTED_CHARS = 500_000
+ALLOWED_SUFFIXES = (".md", ".markdown", ".txt", ".docx", ".pdf")
 
 SECTION_ALIASES = {
     "summary": "summary",
@@ -219,17 +234,61 @@ def _parse_entry_heading(section: str, heading: str) -> dict:
     return {"name": head, "bullets": []}
 
 
-def parse_docx(file_path: str) -> dict:
+def _too_large_chars(name: str) -> ResumeTailorError:
+    return ResumeTailorError(
+        "IMPORT_TOO_LARGE",
+        f"Text extracted from {name} exceeds {MAX_EXTRACTED_CHARS:,} characters; "
+        "this is far larger than any resume. Trim the file and try again.",
+        details={"file": name, "max_chars": MAX_EXTRACTED_CHARS},
+    )
+
+
+def _check_chars(text: str, name: str) -> str:
+    if len(text) > MAX_EXTRACTED_CHARS:
+        raise _too_large_chars(name)
+    return text
+
+
+def _missing_dependency(package: str, suffix: str) -> ResumeTailorError:
+    return ResumeTailorError(
+        "IMPORT_UNSUPPORTED",
+        f"Reading {suffix} files requires the optional package {package!r}. "
+        f"Install it with: pip install {package}  (or import a .md/.txt file instead).",
+        details={"missing_dependency": package},
+    )
+
+
+def _unreadable(name: str, what: str) -> ResumeTailorError:
+    # Deliberately generic: library exceptions can quote file bytes.
+    return ResumeTailorError(
+        "IMPORT_UNSUPPORTED",
+        f"Could not read {name} as a {what} file (corrupt, encrypted or not really a {what}).",
+        details={"file": name},
+    )
+
+
+def _docx_text(file_path: str) -> str:
     try:
         import docx  # python-docx
-    except ImportError as e:
-        raise RuntimeError(
-            "Reading .docx requires python-docx. Install it with: "
-            "pip install python-docx"
-        ) from e
+    except ImportError:
+        raise _missing_dependency("python-docx", ".docx") from None
 
-    document = docx.Document(file_path)
-    text = "\n".join(p.text for p in document.paragraphs)
+    name = Path(file_path).name
+    try:
+        document = docx.Document(file_path)
+    except Exception:
+        raise _unreadable(name, ".docx") from None
+    parts: list[str] = []
+    total = 0
+    for p in document.paragraphs:
+        parts.append(p.text)
+        total += len(p.text) + 1
+        if total > MAX_EXTRACTED_CHARS + 1:
+            raise _too_large_chars(name)
+    return _check_chars("\n".join(parts), name)
+
+
+def _docx_text_to_resume(text: str) -> dict:
     # docx doesn't reliably carry "##" markdown headings, so fall back to a
     # best-effort heuristic: treat any short ALL CAPS or Title Case line with
     # no punctuation as a section heading and re-run the markdown parser.
@@ -252,16 +311,35 @@ def parse_docx(file_path: str) -> dict:
     return resume
 
 
-def parse_pdf(file_path: str) -> dict:
+def parse_docx(file_path: str) -> dict:
+    return _docx_text_to_resume(_docx_text(file_path))
+
+
+def _pdf_text(file_path: str) -> str:
     try:
         import pdfplumber
-    except ImportError as e:
-        raise RuntimeError(
-            "Reading .pdf requires pdfplumber. Install it with: pip install pdfplumber"
-        ) from e
+    except ImportError:
+        raise _missing_dependency("pdfplumber", ".pdf") from None
 
-    with pdfplumber.open(file_path) as pdf:
-        text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+    name = Path(file_path).name
+    parts: list[str] = []
+    total = 0
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                page_text = page.extract_text() or ""
+                parts.append(page_text)
+                total += len(page_text) + 1
+                if total > MAX_EXTRACTED_CHARS + 1:  # stop early; don't extract the rest
+                    raise _too_large_chars(name)
+    except ResumeTailorError:
+        raise
+    except Exception:
+        raise _unreadable(name, ".pdf") from None
+    return _check_chars("\n".join(parts), name)
+
+
+def _pdf_text_to_resume(text: str) -> dict:
     resume = _empty_resume()
     resume["unparsed"].append(
         "RAW PDF TEXT (PDF layout makes automatic section-detection unreliable -- "
@@ -273,17 +351,59 @@ def parse_pdf(file_path: str) -> dict:
     return resume
 
 
-def parse_resume_file(file_path: str) -> dict:
-    path = Path(file_path)
-    if not path.exists():
-        raise FileNotFoundError(f"No such file: {file_path}")
+def parse_pdf(file_path: str) -> dict:
+    return _pdf_text_to_resume(_pdf_text(file_path))
+
+
+def _plain_text(path: Path) -> str:
+    try:
+        text = path.read_bytes().decode("utf-8")
+    except UnicodeDecodeError:
+        raise ResumeTailorError(
+            "IMPORT_UNSUPPORTED",
+            f"{path.name} is not valid UTF-8 text. Re-save it as UTF-8 and try again.",
+            details={"file": path.name},
+        ) from None
+    return _check_chars(text, path.name)
+
+
+def _checked_path(file_path: str) -> Path:
+    """Resolve and vet an import path before any byte of it is read."""
+    raw = Path(str(file_path)).expanduser()
+    name = raw.name
+    try:
+        path = raw.resolve(strict=True)
+        st = path.stat()
+    except (OSError, RuntimeError, ValueError):  # ValueError: e.g. an embedded NUL byte
+        raise ResumeTailorError("IMPORT_UNSUPPORTED", f"File not found: {name}",
+                                details={"file": name}) from None
+    if not stat.S_ISREG(st.st_mode):
+        raise ResumeTailorError("IMPORT_UNSUPPORTED", f"{name} is not a regular file.",
+                                details={"file": name})
     suffix = path.suffix.lower()
-    text = None
+    if suffix not in ALLOWED_SUFFIXES:
+        raise ResumeTailorError(
+            "IMPORT_UNSUPPORTED",
+            f"Unsupported resume format {suffix or '(none)'!r}; use one of {', '.join(ALLOWED_SUFFIXES)}.",
+            details={"file": name, "suffix": suffix},
+        )
+    if st.st_size > MAX_IMPORT_BYTES:
+        raise ResumeTailorError(
+            "IMPORT_TOO_LARGE",
+            f"{name} is {st.st_size:,} bytes; the import limit is {MAX_IMPORT_BYTES:,} bytes.",
+            details={"file": name, "size": st.st_size, "max_bytes": MAX_IMPORT_BYTES},
+        )
+    return path
+
+
+def parse_resume_file(file_path: str) -> dict:
+    """Parse an untrusted resume file. Raises ResumeTailorError
+    (IMPORT_UNSUPPORTED / IMPORT_TOO_LARGE) instead of builtin exceptions;
+    messages name the file's basename but never quote its contents."""
+    path = _checked_path(file_path)
+    suffix = path.suffix.lower()
     if suffix in (".md", ".txt", ".markdown"):
-        text = path.read_text(encoding="utf-8")
-        return parse_markdown(text)
+        return parse_markdown(_plain_text(path))
     if suffix == ".docx":
         return parse_docx(str(path))
-    if suffix == ".pdf":
-        return parse_pdf(str(path))
-    raise ValueError(f"Unsupported resume format: {suffix} (use .md, .txt, .docx, or .pdf)")
+    return parse_pdf(str(path))

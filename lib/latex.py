@@ -6,6 +6,7 @@ straight from this generated .tex, so the two can never drift apart.
 
 from __future__ import annotations
 
+from lib.ids import cert_text, skill_names
 from lib.links import linkedin_label, normalize_url
 
 _SPECIAL_CHARS = {
@@ -58,8 +59,8 @@ _PREAMBLE = r"""\documentclass[letterpaper,11pt]{article}
 \addtolength{\oddsidemargin}{-0.4in}
 \addtolength{\evensidemargin}{-0.4in}
 \addtolength{\textwidth}{0.8in}
-\addtolength{\topmargin}{-0.5in}
-\addtolength{\textheight}{1.0in}
+\addtolength{\topmargin}{-0.4in}
+\addtolength{\textheight}{0.9in}
 
 \urlstyle{same}
 \raggedbottom
@@ -67,23 +68,23 @@ _PREAMBLE = r"""\documentclass[letterpaper,11pt]{article}
 \setlength{\tabcolsep}{0in}
 \setlist{topsep=2pt, itemsep=2pt, parsep=0pt, partopsep=0pt}
 
-\titleformat{\section}{\vspace{2pt}\scshape\raggedright\large}{}{0em}{}[\color{black}\titlerule \vspace{2pt}]
+\titleformat{\section}{\vspace{2pt}\bfseries\scshape\raggedright\large}{}{0em}{}[\color{black}\titlerule \vspace{2pt}]
 
 \newcommand{\resumeItem}[1]{\item\small{#1}}
 
 \newcommand{\resumeSubheading}[4]{
   \item
-    \begin{tabular*}{0.98\textwidth}[t]{l@{\extracolsep{\fill}}r}
+    \begin{tabularx}{\linewidth}[t]{@{}X@{\hspace{0.5em}}r@{}}
       \textbf{#1} & #2 \\
       \textit{\small#3} & \textit{\small #4} \\
-    \end{tabular*}\vspace{2pt}
+    \end{tabularx}\vspace{2pt}
 }
 
 \newcommand{\resumeProjectHeading}[2]{
     \item
-    \begin{tabular*}{0.98\textwidth}{l@{\extracolsep{\fill}}r}
+    \begin{tabularx}{\linewidth}{@{}X@{\hspace{0.5em}}r@{}}
       \small#1 & #2 \\
-    \end{tabular*}\vspace{2pt}
+    \end{tabularx}\vspace{2pt}
 }
 
 \newcommand{\resumeSubHeadingListStart}{\begin{itemize}[leftmargin=0.15in, label={}]}
@@ -128,7 +129,7 @@ def _header(resume: dict) -> str:
 
     return (
         "\\begin{center}\n"
-        f"    \\textbf{{\\Huge \\scshape {name}}} \\\\ \\vspace{{2pt}}\n"
+        f"    \\textbf{{\\huge \\scshape {name}}} \\\\ \\vspace{{2pt}}\n"
         f"    \\small {contact_line}\n"
         "\\end{center}\n"
     )
@@ -194,7 +195,7 @@ def _section_skills(resume: dict) -> str:
     rows = []
     for group in resume["skills"]:
         category = esc(group.get("category", "General"))
-        items = esc(", ".join(group.get("items", [])))
+        items = esc(", ".join(skill_names(group)))
         rows.append(f"     \\textbf{{{category}}}{{: {items}}} \\\\")
     body = " \\vspace{1pt}\n".join(rows)
     return (
@@ -224,7 +225,7 @@ def _section_education(resume: dict) -> str:
 def _section_certifications(resume: dict) -> str:
     if not resume.get("certifications"):
         return ""
-    items = " $\\bullet$ ".join(esc(c) for c in resume["certifications"])
+    items = " $\\bullet$ ".join(esc(cert_text(c)) for c in resume["certifications"])
     return (
         "\\section{Certifications}\n"
         f"\\small{{{items}}}\n\n"
@@ -233,8 +234,12 @@ def _section_certifications(resume: dict) -> str:
 
 def render_latex(resume: dict, template_id: str | None = None) -> str:
     """Build the full .tex source for a resume using the Jake's-Resume-style
-    layout. `template_id` is accepted for interface parity with the other
-    exporters but only `classic-minimalist` is implemented today."""
+    `classic-minimalist` layout. Any other template_id is refused rather than
+    rendered in this layout -- a request for template B must never silently
+    produce template A (use lib.templates.render_template)."""
+    if template_id not in (None, "classic-minimalist"):
+        from lib.errors import ResumeTailorError
+        raise ResumeTailorError("TEMPLATE_NO_RENDERER", f"No LaTeX renderer for template {template_id!r}.")
     body = [
         _header(resume),
         _section_summary(resume),
